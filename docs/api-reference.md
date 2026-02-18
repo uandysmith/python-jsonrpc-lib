@@ -3,7 +3,7 @@
 ## Installation
 
 ```bash
-pip install jsonrpc-lib
+pip install python-jsonrpc-lib
 ```
 
 ## Main Classes

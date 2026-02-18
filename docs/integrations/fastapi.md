@@ -142,7 +142,7 @@ if __name__ == '__main__':
 ## Run the Application
 
 ```bash
-pip install fastapi uvicorn jsonrpc-lib
+pip install fastapi uvicorn python-jsonrpc-lib
 python fastapi_app.py
 ```
 

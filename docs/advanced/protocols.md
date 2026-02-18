@@ -2,7 +2,7 @@
 
 JSON-RPC is a small protocol — the [2.0 specification](https://www.jsonrpc.org/specification) fits on two pages. That simplicity is a feature: the protocol is easy to implement correctly, and correctness matters at integration boundaries.
 
-`jsonrpc-lib` is **strict by default**. This means it generates responses exactly as the spec defines them, and it rejects requests that the spec would call invalid. The reasoning: a standard-compliant client should just work, and a client that sends non-standard requests should know about it rather than receive silently incorrect behavior.
+`python-jsonrpc-lib` is **strict by default**. This means it generates responses exactly as the spec defines them, and it rejects requests that the spec would call invalid. The reasoning: a standard-compliant client should just work, and a client that sends non-standard requests should know about it rather than receive silently incorrect behavior.
 
 Permissive mode is always available — but it's an explicit opt-in, not the default.
 
@@ -186,7 +186,7 @@ No response is sent.
 
 !!! note "`id: null` is NOT a notification"
     A request with `"id": null` gets a response. Only a **missing** `id` field is a notification.
-    This is a common source of bugs in custom JSON-RPC parsers — `jsonrpc-lib` follows the spec precisely.
+    This is a common source of bugs in custom JSON-RPC parsers — `python-jsonrpc-lib` follows the spec precisely.
 
 ```json title="null_id_gets_response.json"
 {"jsonrpc": "2.0", "method": "add", "params": {"a": 1, "b": 2}, "id": null}
@@ -195,7 +195,7 @@ No response is sent.
 
 ## Error Codes
 
-The spec reserves a range of error codes. `jsonrpc-lib` maps them exactly:
+The spec reserves a range of error codes. `python-jsonrpc-lib` maps them exactly:
 
 | Code | Name | When it fires |
 |------|------|---------------|

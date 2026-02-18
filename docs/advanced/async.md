@@ -1,6 +1,6 @@
 # Async Methods
 
-`jsonrpc-lib` supports both sync and async methods in the same server. Define `async def execute()` for IO-bound operations; keep `def execute()` for CPU-bound or simple logic. `rpc.handle_async()` handles both transparently.
+`python-jsonrpc-lib` supports both sync and async methods in the same server. Define `async def execute()` for IO-bound operations; keep `def execute()` for CPU-bound or simple logic. `rpc.handle_async()` handles both transparently.
 
 The choice of sync vs async in `execute()` is independent from whether the framework is async — a sync method works fine in FastAPI, and an async method works fine when called through `handle_async()` in a plain asyncio script.
 

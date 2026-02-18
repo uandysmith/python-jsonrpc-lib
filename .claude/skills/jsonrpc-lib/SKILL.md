@@ -1,10 +1,10 @@
 ---
-name: jsonrpc-lib
-description: Use when writing code that uses the jsonrpc-lib library — creating RPC methods, registering them, organizing with groups, handling errors, or adding context and middleware.
+name: python-jsonrpc-lib
+description: Use when writing code that uses the python-jsonrpc-lib library — creating RPC methods, registering them, organizing with groups, handling errors, or adding context and middleware.
 user-invocable: false
 ---
 
-# jsonrpc-lib usage guide
+# python-jsonrpc-lib usage guide
 
 ## Always use Method classes
 

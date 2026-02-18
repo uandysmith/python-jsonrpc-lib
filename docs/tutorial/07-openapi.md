@@ -484,7 +484,7 @@ openapi = {
 }
 ```
 
-**jsonrpc-lib approach:**
+**python-jsonrpc-lib approach:**
 
 ```python
 # Define method with types
@@ -505,7 +505,7 @@ spec = generator.generate()
 
 **Benefits:**
 
-| Manual Schema | jsonrpc-lib |
+| Manual Schema | python-jsonrpc-lib |
 |---------------|----------------|
 | Write schema separately | Auto-generated |
 | Keep docs in sync manually | Always in sync |
@@ -523,7 +523,7 @@ spec = generator.generate()
 - **Zero config**: Just define types, get documentation
 
 !!! success "Rare Feature"
-    Most JSON-RPC libraries don't have OpenAPI generation. This is a **unique advantage** of jsonrpc-lib!
+    Most JSON-RPC libraries don't have OpenAPI generation. This is a **unique advantage** of python-jsonrpc-lib!
 
 ## What's Next?
 

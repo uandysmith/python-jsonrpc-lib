@@ -1,13 +1,13 @@
-# jsonrpc-lib
+# python-jsonrpc-lib
 
 **Simple, yet solid.** JSON-RPC 1.0/2.0 for Python.
 
-JSON-RPC is a small protocol: a method name, some parameters, a result. jsonrpc-lib keeps it that way. You write ordinary Python functions and dataclasses; the library handles validation, routing, error responses, and API documentation. No framework lock-in, no external dependencies, no boilerplate.
+JSON-RPC is a small protocol: a method name, some parameters, a result. python-jsonrpc-lib keeps it that way. You write ordinary Python functions and dataclasses; the library handles validation, routing, error responses, and API documentation. No framework lock-in, no external dependencies, no boilerplate.
 
 ## Install
 
 ```bash
-pip install jsonrpc-lib
+pip install python-jsonrpc-lib
 ```
 
 ## Quickstart
@@ -50,7 +50,7 @@ If `a` is `"five"` instead of `5`, the caller receives a `-32602 Invalid params`
 
 The same `AddParams` dataclass drives validation, IDE autocomplete, and the OpenAPI schema.
 
-## Why jsonrpc-lib?
+## Why python-jsonrpc-lib?
 
 - **Zero dependencies** — pure Python 3.11+. Nothing to pin, nothing to audit beyond the library itself.
 - **Type validation from dataclasses** — declare parameters as a dataclass, get automatic validation and clear error messages for free.

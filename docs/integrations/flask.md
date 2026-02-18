@@ -129,7 +129,7 @@ if __name__ == '__main__':
 ## Run the Application
 
 ```bash
-pip install flask jsonrpc-lib
+pip install flask python-jsonrpc-lib
 python flask_app.py
 ```
 

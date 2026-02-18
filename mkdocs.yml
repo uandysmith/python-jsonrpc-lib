@@ -1,8 +1,8 @@
-site_name: jsonrpc-lib
+site_name: python-jsonrpc-lib
 site_description: Simple, yet solid - Type-safe JSON-RPC 1.0/2.0 with OpenAPI support
 site_url: https://uandysmith.github.io/python-jsonrpc-lib/
 repo_url: https://github.com/uandysmith/python-jsonrpc-lib
-repo_name: jsonrpc-lib
+repo_name: python-jsonrpc-lib
 
 theme:
   name: material

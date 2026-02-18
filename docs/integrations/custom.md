@@ -1,6 +1,6 @@
 # Custom Transports
 
-`jsonrpc-lib` is transport-agnostic. `rpc.handle(data)` takes a string or bytes and returns a string — everything else is up to you. This page shows how to wire it to transports beyond HTTP.
+`python-jsonrpc-lib` is transport-agnostic. `rpc.handle(data)` takes a string or bytes and returns a string — everything else is up to you. This page shows how to wire it to transports beyond HTTP.
 
 ## TCP Server
 

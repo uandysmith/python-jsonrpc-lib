@@ -1,16 +1,16 @@
-# jsonrpc-lib
+# python-jsonrpc-lib
 
-**Simple, yet solid.** JSON-RPC is a small protocol — a method name, some parameters, a result. jsonrpc-lib keeps it that way. You write ordinary Python functions and dataclasses; the library handles validation, routing, error responses, and even API documentation. No boilerplate, no surprises, no external dependencies.
+**Simple, yet solid.** JSON-RPC is a small protocol — a method name, some parameters, a result. python-jsonrpc-lib keeps it that way. You write ordinary Python functions and dataclasses; the library handles validation, routing, error responses, and even API documentation. No boilerplate, no surprises, no external dependencies.
 
 ---
 
-## Why jsonrpc-lib?
+## Why python-jsonrpc-lib?
 
-**Built-in OpenAPI Generator** — Type hints and docstrings are already there in your code. jsonrpc-lib reads them and produces a full OpenAPI 3.0 spec automatically. Point RapiDoc or Swagger UI at it and you get an interactive API browser — no schema files to write or maintain.
+**Built-in OpenAPI Generator** — Type hints and docstrings are already there in your code. python-jsonrpc-lib reads them and produces a full OpenAPI 3.0 spec automatically. Point RapiDoc or Swagger UI at it and you get an interactive API browser — no schema files to write or maintain.
 
 **Type-safe by default** — Parameters are declared as dataclasses. The library validates every incoming request against the declared types before your code runs. Wrong type? Missing field? The caller gets a clear error before a single line of your logic executes.
 
-**Zero dependencies** — Pure Python 3.11+. `pip install jsonrpc-lib` and you're done. Nothing to pin, nothing to audit beyond the library itself.
+**Zero dependencies** — Pure Python 3.11+. `pip install python-jsonrpc-lib` and you're done. Nothing to pin, nothing to audit beyond the library itself.
 
 **Start simple, grow without friction** — `Method` classes are the recommended foundation: explicit, testable, and production-ready from day one. The `@rpc.method` decorator is there when you want something running in minutes with no ceremony, but comes with limitations. Add `MethodGroup` when you need namespacing, middleware, or hierarchical routing.
 
@@ -21,7 +21,7 @@
 ## Quick Start
 
 ```bash
-pip install jsonrpc-lib
+pip install python-jsonrpc-lib
 ```
 
 The quickest way to start is the decorator API. Register any annotated function and the library takes care of the rest:
@@ -98,7 +98,7 @@ The `AddParams` dataclass is the contract between the caller and the method. Val
 
 ## OpenAPI — Included
 
-Most JSON-RPC libraries treat documentation as something you write separately, after the fact. jsonrpc-lib generates it from the code you've already written:
+Most JSON-RPC libraries treat documentation as something you write separately, after the fact. python-jsonrpc-lib generates it from the code you've already written:
 
 ```python title="openapi_demo.py"
 from jsonrpc import JSONRPC

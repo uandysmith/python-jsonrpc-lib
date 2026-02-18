@@ -1,6 +1,6 @@
 # Philosophy & Design
 
-jsonrpc-lib is built around one idea: the protocol is small, the code should match. You define types, the library validates. You write methods, the library routes. You annotate, the library documents.
+python-jsonrpc-lib is built around one idea: the protocol is small, the code should match. You define types, the library validates. You write methods, the library routes. You annotate, the library documents.
 
 ---
 
@@ -134,7 +134,7 @@ rpc.register('admin', admin)
 !!! success "Unique Feature"
     Most JSON-RPC libraries have no documentation generation — you write schemas by hand.
 
-jsonrpc-lib reads your type hints and docstrings and produces a complete OpenAPI 3.0 specification. Nothing extra to write.
+python-jsonrpc-lib reads your type hints and docstrings and produces a complete OpenAPI 3.0 specification. Nothing extra to write.
 
 ```python title="openapi_generation.py"
 from dataclasses import dataclass
@@ -315,7 +315,7 @@ Restrictive mode is always available for cases where you want to enforce object-
 
 ## Trade-offs & Non-Goals
 
-### What jsonrpc-lib IS NOT
+### What python-jsonrpc-lib IS NOT
 
 - **Not a web framework** — Use Flask/FastAPI for HTTP
 - **Not a client library** — Server-side only
