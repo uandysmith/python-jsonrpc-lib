@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jsonrpc-lib"
+version = "0.3.1"
+description = "Simple, yet solid - Type-safe JSON-RPC 1.0/2.0 with OpenAPI support"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    { name = "Andy Smith" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+keywords = ["jsonrpc", "json-rpc", "rpc", "protocol", "dataclass", "validation"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.0",
+    "ruff>=0.15.0",
+]
+docs = [
+    "mkdocs>=1.5.0",
+    "mkdocs-material>=9.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/uandysmith/python-jsonrpc-lib"
+Documentation = "https://uandysmith.github.io/python-jsonrpc-lib/"
+Repository = "https://github.com/uandysmith/python-jsonrpc-lib"
+Issues = "https://github.com/uandysmith/python-jsonrpc-lib/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jsonrpc"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py311"
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade (modern Python syntax)
+]
+ignore = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["jsonrpc"]

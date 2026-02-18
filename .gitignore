@@ -1,0 +1,8 @@
+site
+htmlcov
+.venv
+.coverage
+.ruff_cache
+.idea
+.vscode
+__pycache__
