@@ -504,7 +504,7 @@ response = rpc.handle(
 
 ## Changelog
 
-### 1.0.0 (First Release)
+### 0.3.1 (First Public Release)
 
 - JSON-RPC 1.0 and 2.0 support
 - Dataclass-based parameter validation
