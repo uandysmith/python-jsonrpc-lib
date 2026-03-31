@@ -67,28 +67,47 @@ import json
 print(json.dumps(spec, indent=2))
 ```
 
-**Generated OpenAPI Schema:**
+**Generated OpenAPI Schema (abbreviated):**
+
+Each method gets its own path using fragment syntax (`#method.name`), with separate
+request and response schemas in `components/schemas`:
 
 ```json title="openapi_output.json"
 {
-  "openapi": "3.0.0",
+  "openapi": "3.0.3",
   "info": {
     "title": "Calculator API",
     "version": "1.0.0",
     "description": "Simple calculator with JSON-RPC 2.0"
   },
   "paths": {
-    "/": {
+    "/jsonrpc#math.calculate": {
       "post": {
-        "summary": "JSON-RPC endpoint",
+        "operationId": "math_calculate",
+        "summary": "Perform a math operation.",
+        "tags": ["math"],
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
-              "schema": {
-                "oneOf": [
-                  {"$ref": "#/components/schemas/CalculateRequest"},
-                  {"$ref": "#/components/schemas/GreetRequest"}
-                ]
+              "schema": {"$ref": "#/components/schemas/math.calculate_request"}
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/math.calculate_response"}
+              }
+            }
+          },
+          "default": {
+            "description": "JSON-RPC Error",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/JSONRPCError"}
               }
             }
           }
@@ -98,11 +117,12 @@ print(json.dumps(spec, indent=2))
   },
   "components": {
     "schemas": {
-      "CalculateRequest": {
+      "math.calculate_request": {
         "type": "object",
         "properties": {
-          "jsonrpc": {"type": "string", "enum": ["2.0"]},
-          "method": {"type": "string", "enum": ["calculate"]},
+          "jsonrpc": {"const": "2.0"},
+          "method": {"const": "math.calculate"},
+          "id": {"type": "integer"},
           "params": {
             "type": "object",
             "properties": {
@@ -111,10 +131,9 @@ print(json.dumps(spec, indent=2))
               "operation": {"type": "string"}
             },
             "required": ["x", "y", "operation"]
-          },
-          "id": {"type": "integer"}
+          }
         },
-        "required": ["jsonrpc", "method", "params", "id"]
+        "required": ["jsonrpc", "method", "id", "params"]
       }
     }
   }
@@ -412,25 +431,35 @@ generator = OpenAPIGenerator(rpc, title="Secure API", version="1.0.0")
 generator.add_security_scheme(
     "BearerAuth",
     scheme_type="http",
-    scheme="bearer",
-    bearerFormat="JWT",
+    options={"scheme": "bearer", "bearerFormat": "JWT"},
 )
 generator.add_security_requirement("BearerAuth")
+
+# API Key
+generator = OpenAPIGenerator(rpc, title="API Key API", version="1.0.0")
+generator.add_security_scheme(
+    "ApiKeyAuth",
+    scheme_type="apiKey",
+    options={"name": "X-API-Key", "in": "header"},
+)
+generator.add_security_requirement("ApiKeyAuth")
 
 # OAuth2
 generator = OpenAPIGenerator(rpc, title="OAuth API", version="1.0.0")
 generator.add_security_scheme(
     "OAuth2",
     scheme_type="oauth2",
-    flows={
-        "authorizationCode": {
-            "authorizationUrl": "https://example.com/oauth/authorize",
-            "tokenUrl": "https://example.com/oauth/token",
-            "scopes": {
-                "read": "Read access",
-                "write": "Write access",
-            },
-        }
+    options={
+        "flows": {
+            "authorizationCode": {
+                "authorizationUrl": "https://example.com/oauth/authorize",
+                "tokenUrl": "https://example.com/oauth/token",
+                "scopes": {
+                    "read": "Read access",
+                    "write": "Write access",
+                },
+            }
+        },
     },
 )
 generator.add_security_requirement("OAuth2", scopes=["read", "write"])

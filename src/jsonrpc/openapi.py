@@ -174,25 +174,31 @@ class OpenAPIGenerator:
         self,
         name: str,
         scheme_type: Literal['apiKey', 'http', 'oauth2', 'openIdConnect'],
-        **kwargs: Any,
+        options: dict[str, Any] | None = None,
     ) -> None:
         """Add authentication/security scheme.
 
         Args:
             name: Scheme name (used in security requirements)
             scheme_type: Type of security scheme
-            **kwargs: Additional scheme properties (scheme, bearerFormat, in, name, etc.)
+            options: Additional scheme properties as a dict.
+                Keys are passed directly into the OpenAPI security scheme object.
 
         Example:
             >>> openapi.add_security_scheme(
             ...     "bearerAuth",
             ...     scheme_type="http",
-            ...     scheme="bearer",
-            ...     bearerFormat="JWT"
+            ...     options={"scheme": "bearer", "bearerFormat": "JWT"},
+            ... )
+            >>> openapi.add_security_scheme(
+            ...     "apiKeyAuth",
+            ...     scheme_type="apiKey",
+            ...     options={"name": "X-API-Key", "in": "header"},
             ... )
         """
         scheme: dict[str, Any] = {'type': scheme_type}
-        scheme.update(kwargs)
+        if options:
+            scheme.update(options)
         self.security_schemes[name] = scheme
 
     def add_header(
@@ -390,13 +396,7 @@ class OpenAPIGenerator:
                                 },
                                 'required': ['code', 'message'],
                             },
-                            'id': {
-                                'oneOf': [
-                                    {'type': 'string'},
-                                    {'type': 'integer'},
-                                    {'type': 'null'},
-                                ]
-                            },
+                            'id': self._error_id_schema(),
                         },
                         'required': ['jsonrpc', 'error', 'id'],
                     },
@@ -420,6 +420,12 @@ class OpenAPIGenerator:
         if self.simplify_id:
             return {'type': 'integer'}
         return {'oneOf': [{'type': 'string'}, {'type': 'integer'}]}
+
+    def _error_id_schema(self) -> dict[str, Any]:
+        """Return JSON Schema for the error response id field (includes null)."""
+        if self.simplify_id:
+            return {'oneOf': [{'type': 'integer'}, {'type': 'null'}]}
+        return {'oneOf': [{'type': 'string'}, {'type': 'integer'}, {'type': 'null'}]}
 
     def _generate_method_request_schema(
         self,

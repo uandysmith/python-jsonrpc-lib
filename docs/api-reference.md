@@ -279,7 +279,7 @@ yaml_str: str = generator.generate_yaml()
 generator.add_security_scheme(
     name: str,
     scheme_type: Literal["apiKey", "http", "oauth2", "openIdConnect"],
-    **kwargs,
+    options: dict[str, Any] | None = None,
 )
 
 # Add global header parameter
@@ -309,8 +309,7 @@ generator = OpenAPIGenerator(
 generator.add_security_scheme(
     "BearerAuth",
     scheme_type="http",
-    scheme="bearer",
-    bearerFormat="JWT",
+    options={"scheme": "bearer", "bearerFormat": "JWT"},
 )
 generator.add_security_requirement("BearerAuth")
 spec = generator.generate()
@@ -503,6 +502,19 @@ response = rpc.handle(
 ---
 
 ## Changelog
+
+### 0.3.2
+
+**Bug fixes:**
+
+- `add_security_scheme`: replaced `**kwargs` with `options: dict` parameter, fixing inability to create `apiKey` schemes (conflicting `name` parameter, `in` as Python reserved word)
+- `_convert_value`: Union types containing multiple dataclasses now correctly try all variants instead of crashing on the first mismatch
+- `simplify_id` flag now consistently applies to JSONRPCError schema in OpenAPI output
+- `unregister()` now clears `.rpc` attribute, allowing re-registration of the same Method instance
+- `max_concurrent` parameter is now validated (`-1` or `>= 1`); previously `0` caused a silent deadlock
+- `version` parameter is now validated at init; invalid values like `'3.0'` raise `ValueError`
+- Fixed `bearer_format` typo in tests (should be `bearerFormat` per OpenAPI spec)
+- Fixed OpenAPI tutorial example to match actual generated output
 
 ### 0.3.1 (First Public Release)
 

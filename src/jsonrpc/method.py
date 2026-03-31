@@ -303,6 +303,8 @@ class MethodGroup:
     def unregister(self, name: str) -> None:
         """Unregister a method or subgroup by name.
 
+        Clears the `.rpc` attribute so the instance can be re-registered.
+
         Args:
             name: Method or subgroup name (not a path)
 
@@ -310,9 +312,12 @@ class MethodGroup:
             KeyError: If name not found in either methods or subgroups
         """
         if name in self._methods:
-            del self._methods[name]
+            method = self._methods.pop(name)
+            if hasattr(method, 'rpc'):
+                del method.rpc
         elif name in self._subgroups:
-            del self._subgroups[name]
+            subgroup = self._subgroups.pop(name)
+            subgroup._clear_rpc()
         else:
             raise KeyError(f"'{name}' not found in group '{self._name}'")
 
@@ -559,3 +564,15 @@ class MethodGroup:
 
         for subgroup in self._subgroups.values():
             subgroup._inject_rpc(rpc)
+
+    def _clear_rpc(self) -> None:
+        """Clear RPC reference from group and all children (recursive)."""
+        if hasattr(self, 'rpc'):
+            del self.rpc
+
+        for method in self._methods.values():
+            if hasattr(method, 'rpc'):
+                del method.rpc
+
+        for subgroup in self._subgroups.values():
+            subgroup._clear_rpc()

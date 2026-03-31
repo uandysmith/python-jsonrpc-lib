@@ -871,9 +871,7 @@ class TestJSONRPCV2DefensiveExceptionHandling(unittest.TestCase):
 
         # Patch _handle_single to raise — bypasses all internal error handling.
         with patch.object(self.rpc, '_handle_single', side_effect=RuntimeError('internal crash')):
-            response = self.rpc.handle(
-                '{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":1}'
-            )
+            response = self.rpc.handle('{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":1}')
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
         self.assertIn('internal crash', data['error']['message'])
@@ -884,9 +882,7 @@ class TestJSONRPCV2DefensiveExceptionHandling(unittest.TestCase):
 
         with patch.object(self.rpc, '_handle_single_async', side_effect=RuntimeError('async crash')):
             response = asyncio.run(
-                self.rpc.handle_async(
-                    '{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":1}'
-                )
+                self.rpc.handle_async('{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":1}')
             )
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
@@ -1136,9 +1132,7 @@ class TestJSONRPCV2SerializationHooks(unittest.TestCase):
 
         rpc = self._make_rpc()
         with patch.object(rpc, 'serialize', side_effect=self._failing_serialize(fail_on_call=1)):
-            response = rpc.handle(
-                '{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":42}'
-            )
+            response = rpc.handle('{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":42}')
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
         self.assertIn('cannot serialize', data['error']['message'])
@@ -1151,9 +1145,7 @@ class TestJSONRPCV2SerializationHooks(unittest.TestCase):
         rpc = self._make_rpc()
         with patch.object(rpc, 'serialize', side_effect=self._failing_serialize(fail_on_call=1)):
             response = asyncio.run(
-                rpc.handle_async(
-                    '{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":42}'
-                )
+                rpc.handle_async('{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":42}')
             )
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
@@ -1164,9 +1156,7 @@ class TestJSONRPCV2SerializationHooks(unittest.TestCase):
         from unittest.mock import patch
 
         rpc = self._make_rpc()
-        batch = json.dumps(
-            [{'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1}]
-        )
+        batch = json.dumps([{'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1}])
         with patch.object(rpc, 'serialize', side_effect=self._failing_serialize(fail_on_call=1)):
             response = rpc.handle(batch)
         data = json.loads(response)
@@ -1177,9 +1167,7 @@ class TestJSONRPCV2SerializationHooks(unittest.TestCase):
         from unittest.mock import patch
 
         rpc = self._make_rpc()
-        batch = json.dumps(
-            [{'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1}]
-        )
+        batch = json.dumps([{'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1}])
         with patch.object(rpc, 'serialize', side_effect=self._failing_serialize(fail_on_call=1)):
             response = asyncio.run(rpc.handle_async(batch))
         data = json.loads(response)
@@ -1219,6 +1207,7 @@ class TestV2Logging(unittest.TestCase):
 
     def test_async_notification_error_logged_at_debug(self):
         """Suppressed async notification errors are logged at DEBUG level."""
+
         class AsyncBrokenMethod(Method):
             async def execute(self, params: None) -> str:
                 raise RuntimeError('Async error!')

@@ -261,6 +261,60 @@ class TestJSONRPCFacade(unittest.TestCase):
         with self.assertRaises(MethodNotFoundError):
             rpc.call_method('math.add', {'a': 1, 'b': 2})
 
+    def test_unregister_method_then_reregister_same_instance(self):
+        """Test re-registering the same Method instance after unregister."""
+        rpc = JSONRPC(version='2.0')
+        math = MethodGroup()
+        add = AddMethod()
+        math.register('add', add)
+        rpc.register('math', math)
+
+        self.assertEqual(rpc.call_method('math.add', {'a': 1, 'b': 2}), 3)
+
+        rpc.unregister('math.add')
+        # Same instance should be re-registerable after unregister
+        math.register('add', add)
+        self.assertEqual(rpc.call_method('math.add', {'a': 5, 'b': 3}), 8)
+
+    def test_unregister_subgroup_clears_rpc_on_children(self):
+        """Test unregistering a subgroup clears .rpc on all nested methods."""
+        rpc = JSONRPC(version='2.0')
+        math = MethodGroup()
+        add = AddMethod()
+        sub = SubtractMethod()
+        math.register('add', add)
+        math.register('subtract', sub)
+        rpc.register('math', math)
+
+        self.assertTrue(hasattr(add, 'rpc'))
+        self.assertTrue(hasattr(sub, 'rpc'))
+
+        rpc.unregister('math')
+        self.assertFalse(hasattr(add, 'rpc'))
+        self.assertFalse(hasattr(sub, 'rpc'))
+
+    def test_invalid_version_raises_value_error(self):
+        """Test that invalid version raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            JSONRPC(version='3.0')
+        self.assertIn("'1.0' or '2.0'", str(ctx.exception))
+
+    def test_max_concurrent_zero_raises_value_error(self):
+        """Test that max_concurrent=0 raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            JSONRPC(max_concurrent=0)
+        self.assertIn('max_concurrent', str(ctx.exception))
+
+    def test_max_concurrent_negative_two_raises_value_error(self):
+        """Test that max_concurrent=-2 raises ValueError."""
+        with self.assertRaises(ValueError):
+            JSONRPC(max_concurrent=-2)
+
+    def test_max_concurrent_minus_one_is_valid(self):
+        """Test that max_concurrent=-1 (unlimited) is accepted."""
+        rpc = JSONRPC(max_concurrent=-1)
+        self.assertEqual(rpc._effective_max_concurrent, -1)
+
 
 class TestCallMethod(unittest.TestCase):
     """Comprehensive tests for call_method() internal API."""

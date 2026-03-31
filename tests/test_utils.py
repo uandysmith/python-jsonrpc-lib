@@ -843,6 +843,26 @@ class TestAdvancedTypeEdgeCases(unittest.TestCase):
         result = _convert_value(value, TypeA | TypeB)
         self.assertIs(result, value)
 
+    def test_convert_value_union_dataclass_field_mismatch(self):
+        """Union fallback: if first dataclass has wrong fields (InvalidParamsError), try next."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class TypeA:
+            name: str
+            age: int
+
+        @dataclass
+        class TypeB:
+            x: int
+            y: int
+
+        # Value matches TypeB fields but not TypeA → should fall through to TypeB
+        result = _convert_value({'x': 1, 'y': 2}, TypeA | TypeB)
+        self.assertIsInstance(result, TypeB)
+        self.assertEqual(result.x, 1)
+        self.assertEqual(result.y, 2)
+
     def test_convert_value_plain_list_returns_as_is(self):
         """Test _convert_value with plain list (no args) - line 246."""
         from jsonrpc.validation import _convert_value

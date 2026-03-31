@@ -226,7 +226,7 @@ def _convert_value(value: Any, expected_type: type, _depth: int = 0) -> Any:
             if arg is not type(None):
                 try:
                     return _convert_value(value, arg, _depth=_depth)
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, InvalidParamsError):
                     continue
         return value
 

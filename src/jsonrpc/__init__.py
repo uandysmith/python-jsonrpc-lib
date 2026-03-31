@@ -46,7 +46,7 @@ from .response import build_error_response, build_response, parse_response
 from .types import ErrorResponse, Request, Response, Version
 from .validation import validate_params, validate_result_type
 
-__version__ = '0.3.1'
+__version__ = '0.3.2'
 
 __all__ = [
     # Main classes

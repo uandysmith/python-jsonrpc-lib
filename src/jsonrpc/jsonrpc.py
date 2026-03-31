@@ -190,6 +190,12 @@ class JSONRPC:
             v1.0: allow_batch=False, allow_dict_params=False, allow_list_params=True
             v2.0: allow_batch=True, allow_dict_params=True, allow_list_params=True
         """
+        if version not in ('1.0', '2.0'):
+            raise ValueError(f"version must be '1.0' or '2.0', got {version!r}")
+
+        if max_concurrent is not None and max_concurrent != -1 and max_concurrent < 1:
+            raise ValueError(f'max_concurrent must be -1 (unlimited) or >= 1, got {max_concurrent}')
+
         self.version = version
         self.validate_results = validate_results
         self.context_type = context_type
@@ -615,9 +621,7 @@ class JSONRPC:
             return self.serialize(response)
 
         if self.max_batch != -1 and len(data) > self.max_batch:
-            error = InvalidRequestError(
-                f'Batch too large: {len(data)} requests, maximum is {self.max_batch}'
-            )
+            error = InvalidRequestError(f'Batch too large: {len(data)} requests, maximum is {self.max_batch}')
             response = build_error_response(error, None, self.version)
             return self.serialize(response)
 
@@ -646,9 +650,7 @@ class JSONRPC:
             return self.serialize(response)
 
         if self.max_batch != -1 and len(data) > self.max_batch:
-            error = InvalidRequestError(
-                f'Batch too large: {len(data)} requests, maximum is {self.max_batch}'
-            )
+            error = InvalidRequestError(f'Batch too large: {len(data)} requests, maximum is {self.max_batch}')
             response = build_error_response(error, None, self.version)
             return self.serialize(response)
 

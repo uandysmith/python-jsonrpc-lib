@@ -649,6 +649,11 @@ class TestOpenAPISchemaValidation(unittest.TestCase):
         id_schema = add_request['properties']['id']
         self.assertEqual(id_schema, {'type': 'integer'})
 
+        # Error schema id should also respect simplify_id
+        error_schema = schemas['JSONRPCError']
+        error_id = error_schema['properties']['id']
+        self.assertEqual(error_id, {'oneOf': [{'type': 'integer'}, {'type': 'null'}]})
+
     def test_simplify_id_false_uses_oneof(self):
         """simplify_id=False produces oneOf[string, integer] for id fields."""
         generator = OpenAPIGenerator(self.rpc, simplify_id=False)
@@ -664,6 +669,12 @@ class TestOpenAPISchemaValidation(unittest.TestCase):
         # Response schema
         add_response = schemas['math.add_response']
         self.assertEqual(add_response['properties']['id'], expected_id)
+
+        # Error schema id should include null
+        error_schema = schemas['JSONRPCError']
+        error_id = error_schema['properties']['id']
+        expected_error_id = {'oneOf': [{'type': 'string'}, {'type': 'integer'}, {'type': 'null'}]}
+        self.assertEqual(error_id, expected_error_id)
 
 
 class TestOpenAPITypeConversionEdgeCases(unittest.TestCase):
@@ -817,7 +828,11 @@ class TestOpenAPISecurityAndHeaders(unittest.TestCase):
         generator = OpenAPIGenerator(rpc)
 
         # Add security scheme
-        generator.add_security_scheme(name='bearerAuth', scheme_type='http', scheme='bearer', bearer_format='JWT')
+        generator.add_security_scheme(
+            name='bearerAuth',
+            scheme_type='http',
+            options={'scheme': 'bearer', 'bearerFormat': 'JWT'},
+        )
 
         # Add security requirement
         generator.add_security_requirement('bearerAuth')
@@ -828,9 +843,37 @@ class TestOpenAPISecurityAndHeaders(unittest.TestCase):
         self.assertIn('securitySchemes', spec['components'])
         self.assertIn('bearerAuth', spec['components']['securitySchemes'])
 
+        # Check security scheme content
+        scheme = spec['components']['securitySchemes']['bearerAuth']
+        self.assertEqual(scheme['type'], 'http')
+        self.assertEqual(scheme['scheme'], 'bearer')
+        self.assertEqual(scheme['bearerFormat'], 'JWT')
+
         # Check security requirement is applied globally
         self.assertIn('security', spec)
         self.assertEqual(spec['security'], [{'bearerAuth': []}])
+
+    def test_add_apikey_security_scheme(self):
+        """Test adding apiKey security scheme with name and in fields."""
+        rpc = JSONRPC()
+        math_group = MethodGroup()
+        math_group.register('add', AddMethod())
+        rpc.register('math', math_group)
+
+        generator = OpenAPIGenerator(rpc)
+        generator.add_security_scheme(
+            name='apiKeyAuth',
+            scheme_type='apiKey',
+            options={'name': 'X-API-Key', 'in': 'header'},
+        )
+        generator.add_security_requirement('apiKeyAuth')
+
+        spec = generator.generate()
+
+        scheme = spec['components']['securitySchemes']['apiKeyAuth']
+        self.assertEqual(scheme['type'], 'apiKey')
+        self.assertEqual(scheme['name'], 'X-API-Key')
+        self.assertEqual(scheme['in'], 'header')
 
     def test_add_oauth2_security_with_scopes(self):
         """Test adding OAuth2 security with scopes."""
@@ -845,12 +888,14 @@ class TestOpenAPISecurityAndHeaders(unittest.TestCase):
         generator.add_security_scheme(
             name='oauth2',
             scheme_type='oauth2',
-            flows={
-                'authorizationCode': {
-                    'authorizationUrl': 'https://example.com/oauth/authorize',
-                    'tokenUrl': 'https://example.com/oauth/token',
-                    'scopes': {'read': 'Read access', 'write': 'Write access'},
-                }
+            options={
+                'flows': {
+                    'authorizationCode': {
+                        'authorizationUrl': 'https://example.com/oauth/authorize',
+                        'tokenUrl': 'https://example.com/oauth/token',
+                        'scopes': {'read': 'Read access', 'write': 'Write access'},
+                    }
+                },
             },
         )
 
@@ -858,6 +903,12 @@ class TestOpenAPISecurityAndHeaders(unittest.TestCase):
         generator.add_security_requirement('oauth2', scopes=['read', 'write'])
 
         spec = generator.generate()
+
+        # Check security scheme content
+        scheme = spec['components']['securitySchemes']['oauth2']
+        self.assertEqual(scheme['type'], 'oauth2')
+        self.assertIn('flows', scheme)
+        self.assertIn('authorizationCode', scheme['flows'])
 
         # Check security requirement includes scopes
         self.assertIn('security', spec)
