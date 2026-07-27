@@ -384,6 +384,26 @@ rpc.register('update_config', UpdateConfig())
 }
 ```
 
+!!! warning "A positional array binds into nested objects too"
+    Params sent as a JSON array bind to fields **in declaration order**, and that
+    applies at every level — a nested object can be filled from an array as well:
+
+    ```json
+    {"params": {"inner": [1, 2]}}   →   Inner(x=1, y=2)
+    ```
+
+    The consequence is worth stating plainly: **the field order of every nested
+    dataclass is part of your public API.** Swapping two fields is a breaking
+    change for any client that sends arrays, and it breaks silently — the values
+    still have the right types, so validation has nothing to complain about.
+
+    If your methods take nested structures, either fix the order forever or
+    accept objects only:
+
+    ```python
+    rpc = JSONRPC(version='2.0', allow_list_params=False)
+    ```
+
 ## Key Points
 
 - **Nested dataclasses**: Automatic recursive validation

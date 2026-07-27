@@ -170,9 +170,29 @@ rpc.register('public', public_group)
 
 ## Middleware
 
-`MethodGroup` is the extension point for cross-cutting concerns. Override `execute_method()` to inject behavior before and after every method call in the group — logging, caching, rate limiting, authentication guards, and more.
+`MethodGroup` is the extension point for cross-cutting concerns. Override `around_call()` to inject behavior before and after every call into the group's subtree — logging, caching, rate limiting, authentication guards, and more.
 
-Groups compose cleanly: wrap one group inside another to layer behaviors without touching method logic.
+```python
+class Unauthenticated(JSONRPCError):
+    code = -32010
+    message = 'Authentication required'
+
+class RequireAuthGroup(MethodGroup):
+    def around_call(self, call, context, call_next):
+        if context.user_id is None:
+            raise Unauthenticated()
+        return call_next(context)
+```
+
+Refuse with a `JSONRPCError` subclass. Any other exception — `PermissionError`,
+a framework's own `Forbidden` — is answered with a bare `-32603 Internal error`
+and logged with a traceback, so the caller cannot tell a refusal from a fault and
+neither can you.
+
+Groups compose cleanly: wrap one group inside another to layer behaviors without touching method logic. Every group on the path runs, outermost first, so a guard mounted at `admin` covers `admin.user.delete` and everything else below it.
+
+!!! note "`around_call()`, not `execute_method()`"
+    `execute_method()` runs only on the group a method is registered on. It is the right hook for changing how that group invokes its own methods, and the wrong one for guarding a namespace — mounting a group that overrides it but owns only subgroups is rejected at registration for exactly that reason.
 
 → [Middleware](../advanced/middleware.md) - Reference implementations: logging, caching, rate limiting, auth guards
 
@@ -180,9 +200,10 @@ Groups compose cleanly: wrap one group inside another to layer behaviors without
 
 - **MethodGroup**: Organizes methods with prefix
 - **Hierarchical**: Groups can contain groups (unlimited depth)
-- **Middleware**: Override `execute_method()` for custom behavior
+- **Middleware**: Override `around_call()` for behavior covering the whole subtree
 - **Composition**: Combine multiple groups for layered functionality
 - **Separation**: Business logic (Method) vs routing (MethodGroup)
+- **Singletons**: one instance is registered in exactly one place and shared across every request and thread — keep per-request state in `context`, never on `self`
 
 !!! tip "Real-World Usage"
     Use groups for:

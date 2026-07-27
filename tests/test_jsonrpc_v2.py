@@ -12,11 +12,13 @@ Key features of 2.0:
 import asyncio
 import json
 import unittest
+from dataclasses import dataclass, field
 
 from jsonrpc import JSONRPC, MethodGroup
 from jsonrpc.method import Method
 from tests.fixtures import (
     AddMethod,
+    AddParams,
     AsyncDataclassResultMethod,
     AsyncMethod,
     DataclassResultMethod,
@@ -783,7 +785,8 @@ class TestJSONRPCV2ErrorHandling(unittest.TestCase):
 
         self.assertEqual('error' in data, True)
         self.assertEqual(data['error']['code'], -32603)  # Internal error
-        self.assertEqual('Unexpected error' in data['error']['message'], True)
+        # Sanitized by default: the exception text is logged, not sent to the caller.
+        self.assertEqual(data['error']['message'], 'Internal error')
 
     def test_handle_async_unexpected_exception(self):
         """Test handle_async() with unexpected exception returns InternalError."""
@@ -849,7 +852,7 @@ class TestJSONRPCV2DefensiveExceptionHandling(unittest.TestCase):
 
             self.assertEqual('error' in data, True)
             self.assertEqual(data['error']['code'], -32603)  # Internal error
-            self.assertEqual('dispatcher error' in data['error']['message'], True)
+            self.assertEqual(data['error']['message'], 'Internal error')
 
     def test_handle_async_with_internal_exception_in_dispatcher(self):
         """Test handle_async() when root_group raises unexpected exception."""
@@ -863,7 +866,7 @@ class TestJSONRPCV2DefensiveExceptionHandling(unittest.TestCase):
 
             self.assertEqual('error' in data, True)
             self.assertEqual(data['error']['code'], -32603)
-            self.assertEqual('async dispatcher error' in data['error']['message'], True)
+            self.assertEqual(data['error']['message'], 'Internal error')
 
     def test_handle_outer_except_catches_exception_from_handle_single(self):
         """handle() outer except fires when _handle_single itself raises unexpectedly."""
@@ -874,7 +877,7 @@ class TestJSONRPCV2DefensiveExceptionHandling(unittest.TestCase):
             response = self.rpc.handle('{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":1}')
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
-        self.assertIn('internal crash', data['error']['message'])
+        self.assertEqual(data['error']['message'], 'Internal error')
 
     def test_handle_async_outer_except_catches_exception_from_handle_single_async(self):
         """handle_async() outer except fires when _handle_single_async itself raises unexpectedly."""
@@ -886,7 +889,7 @@ class TestJSONRPCV2DefensiveExceptionHandling(unittest.TestCase):
             )
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
-        self.assertIn('async crash', data['error']['message'])
+        self.assertEqual(data['error']['message'], 'Internal error')
 
 
 class TestJSONRPCV2SyncBatchEdgeCases(unittest.TestCase):
@@ -1135,7 +1138,7 @@ class TestJSONRPCV2SerializationHooks(unittest.TestCase):
             response = rpc.handle('{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":2},"id":42}')
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
-        self.assertIn('cannot serialize', data['error']['message'])
+        self.assertEqual(data['error']['message'], 'Internal error')
         self.assertEqual(data['id'], 42)
 
     def test_handle_single_async_serialize_failure_returns_internal_error(self):
@@ -1149,29 +1152,83 @@ class TestJSONRPCV2SerializationHooks(unittest.TestCase):
             )
         data = json.loads(response)
         self.assertEqual(data['error']['code'], -32603)
-        self.assertIn('cannot serialize', data['error']['message'])
+        self.assertEqual(data['error']['message'], 'Internal error')
 
-    def test_handle_batch_serialize_failure_returns_internal_error(self):
-        """_handle_batch: TypeError from serialize() on batch falls back to InternalError."""
+    def test_handle_batch_serialize_failure_keeps_the_array_and_the_ids(self):
+        """_handle_batch: a batch-level serialize() failure is retried per entry.
+
+        The methods in the batch have already run. Collapsing the array into one
+        id-less error object destroys every receipt, and a client that gets no
+        receipt can only retry -- re-executing everything that already committed.
+        """
         from unittest.mock import patch
 
         rpc = self._make_rpc()
-        batch = json.dumps([{'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1}])
+        batch = json.dumps(
+            [
+                {'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1},
+                {'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 3, 'b': 4}, 'id': 2},
+            ]
+        )
         with patch.object(rpc, 'serialize', side_effect=self._failing_serialize(fail_on_call=1)):
             response = rpc.handle(batch)
         data = json.loads(response)
-        self.assertEqual(data['error']['code'], -32603)
 
-    def test_handle_batch_async_serialize_failure_returns_internal_error(self):
-        """_handle_batch_async: TypeError from serialize() on batch falls back to InternalError."""
+        self.assertIsInstance(data, list)
+        self.assertEqual([entry['id'] for entry in data], [1, 2])
+        self.assertEqual([entry['result'] for entry in data], [3, 7])
+
+    def test_handle_batch_gives_up_only_when_even_the_repaired_batch_fails(self):
+        """Last-resort arm: a serialize() override that fails on everything.
+
+        The per-entry retry rebuilds the batch out of plain error envelopes. If
+        those cannot be serialized either, there is nothing left to preserve and
+        the caller gets a single error.
+        """
         from unittest.mock import patch
 
         rpc = self._make_rpc()
-        batch = json.dumps([{'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1}])
+        batch = json.dumps(
+            [
+                {'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1},
+                {'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 3, 'b': 4}, 'id': 2},
+            ]
+        )
+
+        calls = [0]
+        real_serialize = rpc.serialize
+
+        def always_failing_except_the_last(data, **kwargs):
+            calls[0] += 1
+            if calls[0] <= 4:  # batch, both entries, repaired batch
+                raise TypeError('cannot serialize anything')
+            return real_serialize(data, **kwargs)
+
+        with patch.object(rpc, 'serialize', side_effect=always_failing_except_the_last):
+            response = rpc.handle(batch)
+
+        data = json.loads(response)
+        self.assertEqual(data['error']['code'], -32603)
+        self.assertIsNone(data['id'])
+
+    def test_handle_batch_async_serialize_failure_keeps_the_array_and_the_ids(self):
+        """_handle_batch_async: same per-entry retry as the synchronous path."""
+        from unittest.mock import patch
+
+        rpc = self._make_rpc()
+        batch = json.dumps(
+            [
+                {'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 1, 'b': 2}, 'id': 1},
+                {'jsonrpc': '2.0', 'method': 'math.add', 'params': {'a': 3, 'b': 4}, 'id': 2},
+            ]
+        )
         with patch.object(rpc, 'serialize', side_effect=self._failing_serialize(fail_on_call=1)):
             response = asyncio.run(rpc.handle_async(batch))
         data = json.loads(response)
-        self.assertEqual(data['error']['code'], -32603)
+
+        self.assertIsInstance(data, list)
+        self.assertEqual([entry['id'] for entry in data], [1, 2])
+        self.assertEqual([entry['result'] for entry in data], [3, 7])
 
 
 class TestV2Logging(unittest.TestCase):
@@ -1186,14 +1243,19 @@ class TestV2Logging(unittest.TestCase):
 
         self.rpc.register('broken', BrokenMethod())
 
-    def test_notification_error_logged_at_debug(self):
-        """Suppressed notification errors are logged at DEBUG level."""
-        with self.assertLogs('jsonrpc-lib', level='DEBUG') as cm:
+    def test_notification_error_logged_at_warning(self):
+        """Suppressed notification errors are logged at WARNING level.
+
+        DEBUG made them invisible under any normal production log configuration,
+        and the wire says nothing about a notification by design, so this record
+        is the only evidence the call failed.
+        """
+        with self.assertLogs('jsonrpc-lib', level='WARNING') as cm:
             request = '{"jsonrpc":"2.0","method":"broken"}'
             response = self.rpc.handle(request)
 
         self.assertIsNone(response)
-        self.assertTrue(any('Notification error suppressed' in msg for msg in cm.output))
+        self.assertTrue(any('Notification failed' in msg for msg in cm.output))
 
     def test_unhandled_exception_logged_at_error(self):
         """Unhandled exceptions in method dispatch are logged at ERROR level."""
@@ -1205,8 +1267,8 @@ class TestV2Logging(unittest.TestCase):
         self.assertEqual(data['error']['code'], -32603)
         self.assertTrue(any('Unhandled exception' in msg for msg in cm.output))
 
-    def test_async_notification_error_logged_at_debug(self):
-        """Suppressed async notification errors are logged at DEBUG level."""
+    def test_async_notification_error_logged_at_warning(self):
+        """Suppressed async notification errors are logged at WARNING level."""
 
         class AsyncBrokenMethod(Method):
             async def execute(self, params: None) -> str:
@@ -1215,12 +1277,700 @@ class TestV2Logging(unittest.TestCase):
         rpc = JSONRPC(version='2.0')
         rpc.register('async_broken', AsyncBrokenMethod())
 
-        with self.assertLogs('jsonrpc-lib', level='DEBUG') as cm:
+        with self.assertLogs('jsonrpc-lib', level='WARNING') as cm:
             request = '{"jsonrpc":"2.0","method":"async_broken"}'
             response = asyncio.run(rpc.handle_async(request))
 
         self.assertIsNone(response)
-        self.assertTrue(any('Notification error suppressed' in msg for msg in cm.output))
+        self.assertTrue(any('Notification failed' in msg for msg in cm.output))
+
+
+@dataclass
+class AmountParams:
+    """A float the caller controls, checked against a host-side limit."""
+
+    amount: float
+
+
+LIMIT = 1000.0
+
+
+class TransferMethod(Method):
+    """The shape of a host-side bound check."""
+
+    def execute(self, params: AmountParams) -> float:
+        if params.amount > LIMIT:
+            raise ValueError('over limit')
+        return params.amount
+
+
+class InfiniteResultMethod(Method):
+    def execute(self, params: None) -> float:
+        return float('inf')
+
+
+class AdminDeleteMethod(Method):
+    def execute(self, params: None) -> str:
+        return 'deleted'
+
+
+def strict_loads(text):
+    """json.loads() that refuses the non-standard constants, like other stacks do."""
+
+    def reject(name):
+        raise ValueError(f'not valid JSON: {name}')
+
+    return json.loads(text, parse_constant=reject)
+
+
+class TestNonFiniteFloatsInbound(unittest.TestCase):
+    def setUp(self):
+        self.rpc = JSONRPC()
+        self.rpc.register('transfer', TransferMethod())
+
+    def test_nan_literal_is_refused_as_a_parse_error(self):
+        """`nan > limit` is False, so a NaN slips through every `if x > limit` guard."""
+        response = self.rpc.handle('{"jsonrpc":"2.0","method":"transfer","params":{"amount":NaN},"id":1}')
+        data = json.loads(response)
+        self.assertEqual(data['error']['code'], -32700)
+
+    def test_infinity_literal_is_refused_as_a_parse_error(self):
+        response = self.rpc.handle('{"jsonrpc":"2.0","method":"transfer","params":{"amount":Infinity},"id":1}')
+        data = json.loads(response)
+        self.assertEqual(data['error']['code'], -32700)
+
+    def test_overflowing_literal_is_refused_as_invalid_params(self):
+        """1e400 is legal JSON that json.loads() turns into inf.
+
+        parse_constant never sees it - there is no NaN or Infinity token in the
+        body - so the float check has to catch it.
+        """
+        response = self.rpc.handle('{"jsonrpc":"2.0","method":"transfer","params":{"amount":1e400},"id":1}')
+        data = json.loads(response)
+        self.assertEqual(data['error']['code'], -32602)
+
+    def test_ordinary_floats_still_pass(self):
+        response = self.rpc.handle('{"jsonrpc":"2.0","method":"transfer","params":{"amount":12.5},"id":1}')
+        self.assertEqual(json.loads(response)['result'], 12.5)
+
+    def test_integers_are_still_accepted_for_a_float_field(self):
+        response = self.rpc.handle('{"jsonrpc":"2.0","method":"transfer","params":{"amount":12},"id":1}')
+        self.assertEqual(json.loads(response)['result'], 12)
+
+
+class TestNonFiniteFloatsOutbound(unittest.TestCase):
+    def test_infinite_result_does_not_emit_invalid_json(self):
+        """A response carrying the bare token Infinity is not valid JSON.
+
+        json.dumps() emits it happily, so the corruption is silent server-side
+        and only detonates in the caller's parser.
+        """
+        rpc = JSONRPC()
+        rpc.register('inf', InfiniteResultMethod())
+
+        response = rpc.handle('{"jsonrpc":"2.0","method":"inf","id":1}')
+
+        strict_loads(response)  # must not raise
+        data = json.loads(response)
+        self.assertEqual(data['error']['code'], -32603)
+
+    def test_serialize_refuses_a_non_finite_float(self):
+        rpc = JSONRPC()
+        with self.assertRaises(ValueError):
+            rpc.serialize({'result': float('nan')})
+
+    def test_serialize_still_produces_the_usual_separators(self):
+        rpc = JSONRPC()
+        self.assertEqual(rpc.serialize({'a': 1, 'b': [1, 2]}), '{"a": 1, "b": [1, 2]}')
+
+    def test_serialize_still_accepts_keyword_arguments(self):
+        rpc = JSONRPC()
+        self.assertEqual(rpc.serialize({'a': 1}, separators=(',', ':')), '{"a":1}')
+
+
+class TestBytesMustBeUtf8(unittest.TestCase):
+    def setUp(self):
+        self.rpc = JSONRPC()
+        self.rpc.register('ping', NoParamsMethod())
+        self.body = '{"jsonrpc":"2.0","method":"ping","id":1}'
+
+    def test_utf8_bytes_are_accepted(self):
+        response = self.rpc.handle(self.body.encode('utf-8'))
+        self.assertEqual(json.loads(response)['result'], 'pong')
+
+    def test_utf16_bytes_are_refused(self):
+        """json.loads() sniffs UTF-16/32 for bytes input; the wire format is UTF-8."""
+        response = self.rpc.handle(self.body.encode('utf-16'))
+        self.assertEqual(json.loads(response)['error']['code'], -32700)
+
+    def test_invalid_utf8_is_refused(self):
+        response = self.rpc.handle(b'{"jsonrpc":"2.0","method":"\xff\xfe","id":1}')
+        self.assertEqual(json.loads(response)['error']['code'], -32700)
+
+
+class TestRequestMustBeAJsonObject(unittest.TestCase):
+    """A JSON string containing a request is not a request."""
+
+    def setUp(self):
+        self.rpc = JSONRPC()
+        self.rpc.register('admin_delete', AdminDeleteMethod())
+        self.inner = '{"jsonrpc":"2.0","method":"admin_delete","id":9}'
+
+    def test_a_json_string_body_is_not_unwrapped_and_executed(self):
+        body = json.dumps(self.inner)
+        self.assertIsInstance(json.loads(body), str)
+
+        response = self.rpc.handle(body)
+        data = json.loads(response)
+
+        self.assertEqual(data['error']['code'], -32600)
+        self.assertNotIn('deleted', response)
+
+    def test_a_json_string_inside_a_batch_is_not_unwrapped_either(self):
+        response = self.rpc.handle(json.dumps([self.inner]))
+        data = json.loads(response)
+        self.assertEqual(data[0]['error']['code'], -32600)
+
+    def test_a_json_string_body_is_refused_on_the_async_path_too(self):
+        response = asyncio.run(self.rpc.handle_async(json.dumps(self.inner)))
+        self.assertEqual(json.loads(response)['error']['code'], -32600)
+
+    def test_a_custom_deserialize_hook_is_not_bypassed(self):
+        """The second parse used to run below deserialize(), on stdlib json.
+
+        A host that replaced the parser - for speed, for limits, for a different
+        library - did not get either on that path.
+        """
+        seen = []
+
+        class CountingRPC(JSONRPC):
+            def deserialize(self, data):
+                seen.append(data)
+                return super().deserialize(data)
+
+        rpc = CountingRPC()
+        rpc.register('admin_delete', AdminDeleteMethod())
+        rpc.handle(json.dumps(self.inner))
+
+        self.assertEqual(len(seen), 1)
+
+    def test_a_scalar_body_is_refused(self):
+        self.assertEqual(json.loads(self.rpc.handle('5'))['error']['code'], -32600)
+
+    def test_a_null_body_is_refused(self):
+        self.assertEqual(json.loads(self.rpc.handle('null'))['error']['code'], -32600)
+
+
+class TestBatchSerializationIsolation(unittest.TestCase):
+    """One unserializable result must not take the whole batch down with it."""
+
+    def setUp(self):
+        self.committed = []
+
+        committed = self.committed
+
+        class Payment(Method):
+            def execute(self, params: AddParams) -> str:
+                committed.append(params.a)
+                return 'settled'
+
+        class Metrics(Method):
+            def execute(self, params: None) -> object:
+                import datetime
+
+                return datetime.datetime(2020, 1, 1)
+
+        self.rpc = JSONRPC()
+        self.rpc.register('pay', Payment())
+        self.rpc.register('metrics', Metrics())
+
+        self.batch = json.dumps(
+            [{'jsonrpc': '2.0', 'method': 'pay', 'params': {'a': i, 'b': 0}, 'id': i} for i in range(3)]
+            + [{'jsonrpc': '2.0', 'method': 'metrics', 'id': 99}]
+        )
+
+    def test_committed_siblings_keep_their_receipts(self):
+        response = self.rpc.handle(self.batch)
+        data = json.loads(response)
+
+        self.assertEqual(self.committed, [0, 1, 2])
+        self.assertIsInstance(data, list)
+        self.assertEqual(len(data), 4)
+        self.assertEqual([entry.get('result') for entry in data[:3]], ['settled'] * 3)
+        self.assertEqual([entry['id'] for entry in data], [0, 1, 2, 99])
+
+    def test_only_the_failing_entry_becomes_an_error(self):
+        data = json.loads(self.rpc.handle(self.batch))
+        self.assertEqual(data[3]['error']['code'], -32603)
+        self.assertEqual(data[3]['id'], 99)
+
+    def test_the_async_path_isolates_the_same_way(self):
+        data = json.loads(asyncio.run(self.rpc.handle_async(self.batch)))
+        self.assertIsInstance(data, list)
+        self.assertEqual([entry['id'] for entry in data], [0, 1, 2, 99])
+        self.assertEqual(data[3]['error']['code'], -32603)
+
+    def test_a_healthy_batch_is_unaffected(self):
+        batch = json.dumps([{'jsonrpc': '2.0', 'method': 'pay', 'params': {'a': 1, 'b': 0}, 'id': 1}])
+        data = json.loads(self.rpc.handle(batch))
+        self.assertEqual(data[0]['result'], 'settled')
+
+
+class TestInternalErrorSanitization(unittest.TestCase):
+    """Exception text is written for an operator, not for a caller."""
+
+    def setUp(self):
+        class Boom(Method):
+            def execute(self, params: None) -> str:
+                raise RuntimeError("psycopg2 FATAL: password authentication failed for user 'app'")
+
+        self.method_class = Boom
+
+    def test_the_wire_gets_a_bare_internal_error_by_default(self):
+        rpc = JSONRPC()
+        rpc.register('boom', self.method_class())
+        data = json.loads(rpc.handle('{"jsonrpc":"2.0","method":"boom","id":1}'))
+
+        self.assertEqual(data['error']['code'], -32603)
+        self.assertEqual(data['error']['message'], 'Internal error')
+        self.assertNotIn('psycopg2', json.dumps(data))
+
+    def test_the_full_exception_still_reaches_the_log(self):
+        rpc = JSONRPC()
+        rpc.register('boom', self.method_class())
+        with self.assertLogs('jsonrpc-lib', level='ERROR') as cm:
+            rpc.handle('{"jsonrpc":"2.0","method":"boom","id":1}')
+        self.assertTrue(any('psycopg2' in record for record in cm.output))
+
+    def test_expose_internal_errors_restores_the_old_behaviour(self):
+        rpc = JSONRPC(expose_internal_errors=True)
+        rpc.register('boom', self.method_class())
+        data = json.loads(rpc.handle('{"jsonrpc":"2.0","method":"boom","id":1}'))
+        self.assertIn('psycopg2', data['error']['message'])
+
+    def test_deliberate_protocol_errors_are_never_sanitized(self):
+        """A JSONRPCError a method raises is the application's own vocabulary."""
+        from jsonrpc.errors import InvalidParamsError
+
+        class Refusing(Method):
+            def execute(self, params: None) -> str:
+                raise InvalidParamsError('Account is frozen, contact support')
+
+        rpc = JSONRPC()
+        rpc.register('refusing', Refusing())
+        data = json.loads(rpc.handle('{"jsonrpc":"2.0","method":"refusing","id":1}'))
+
+        self.assertEqual(data['error']['code'], -32602)
+        self.assertEqual(data['error']['message'], 'Account is frozen, contact support')
+
+    def test_the_wiring_diagnostic_is_not_sanitized_away(self):
+        """Dispatch's own "you wired this wrong" message must reach the developer.
+
+        It names the method path and the entry point to use - facts the caller
+        already has - so the reason for sanitizing exception text does not apply,
+        and losing it turns a one-line fix into a debugging session.
+        """
+        rpc = JSONRPC(version='2.0')
+        rpc.register('async_op', AsyncMethod())
+
+        data = json.loads(rpc.handle('{"jsonrpc":"2.0","method":"async_op","id":1}'))
+
+        self.assertEqual(data['error']['code'], -32603)
+        self.assertIn('use dispatch_async() instead', data['error']['message'])
+
+    def test_an_ordinary_exception_is_still_sanitized(self):
+        rpc = JSONRPC(version='2.0')
+        rpc.register('boom', self.method_class())
+
+        data = json.loads(rpc.handle('{"jsonrpc":"2.0","method":"boom","id":1}'))
+        self.assertEqual(data['error']['message'], 'Internal error')
+
+    def test_a_refused_request_is_logged(self):
+        """Method resolution and params validation both refuse before any guard runs.
+
+        That arm used to write nothing at any level, so enumeration left no trace.
+        """
+        rpc = JSONRPC()
+        rpc.register('ping', NoParamsMethod())
+        with self.assertLogs('jsonrpc-lib', level='INFO') as cm:
+            rpc.handle('{"jsonrpc":"2.0","method":"does_not_exist","id":1}')
+        self.assertTrue(any('does_not_exist' in record for record in cm.output))
+
+
+class TestErrorResponsesEchoTheId(unittest.TestCase):
+    """An error response must carry the id of the request that caused it.
+
+    The spec allows a null id only when the id could not be detected. A bad
+    `method` or `params` is not that case - the id is sitting right there. A
+    client keyed on ids used to be handed an answer it could not match to any
+    outstanding call, and waited for one that had already arrived.
+    """
+
+    def setUp(self):
+        self.rpc = JSONRPC(version='2.0')
+        math = MethodGroup()
+        math.register('add', AddMethod())
+        self.rpc.register('math', math)
+
+    def _error(self, body):
+        return json.loads(self.rpc.handle(body))
+
+    def test_params_of_the_wrong_shape_keeps_the_id(self):
+        data = self._error('{"jsonrpc":"2.0","method":"math.add","params":"oops","id":42}')
+        self.assertEqual(data['error']['code'], -32600)
+        self.assertEqual(data['id'], 42)
+
+    def test_wrong_protocol_version_keeps_the_id(self):
+        data = self._error('{"jsonrpc":"1.5","method":"math.add","params":{"a":1,"b":1},"id":42}')
+        self.assertEqual(data['id'], 42)
+
+    def test_non_string_method_keeps_the_id(self):
+        data = self._error('{"jsonrpc":"2.0","method":5,"params":{"a":1,"b":1},"id":42}')
+        self.assertEqual(data['id'], 42)
+
+    def test_a_string_id_is_echoed_too(self):
+        data = self._error('{"jsonrpc":"2.0","method":5,"id":"abc"}')
+        self.assertEqual(data['id'], 'abc')
+
+    def test_an_unusable_id_is_still_null(self):
+        """Here the id genuinely cannot be determined, which is the spec's case."""
+        data = self._error('{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":1},"id":4.2}')
+        self.assertIsNone(data['id'])
+
+    def test_batch_entries_stay_distinguishable(self):
+        data = self._error(
+            '[{"jsonrpc":"2.0","method":"math.add","params":"x","id":1},'
+            ' {"jsonrpc":"2.0","method":"math.add","params":"y","id":2}]'
+        )
+        self.assertEqual([entry['id'] for entry in data], [1, 2])
+
+
+class TestBatchEntriesMustBeVersion2(unittest.TestCase):
+    """Batching exists only in 2.0, so every entry is a 2.0 request.
+
+    A 1.0-framed entry used to be answered in 1.0 framing, producing one array
+    holding two different response shapes.
+    """
+
+    def setUp(self):
+        self.rpc = JSONRPC(version='2.0')
+        math = MethodGroup()
+        math.register('add', AddMethod())
+        self.rpc.register('math', math)
+
+    def test_an_entry_without_the_version_is_refused(self):
+        data = json.loads(
+            self.rpc.handle(
+                '[{"jsonrpc":"2.0","method":"math.add","params":{"a":1,"b":1},"id":7},'
+                ' {"method":"math.add","params":[3,3],"id":8}]'
+            )
+        )
+        self.assertEqual(data[0]['result'], 2)
+        self.assertEqual(data[1]['error']['code'], -32600)
+        self.assertEqual(data[1]['id'], 8)
+        self.assertTrue(all('jsonrpc' in entry for entry in data))
+
+    def test_a_single_request_still_accepts_1_0_framing(self):
+        """Only batching is 2.0-only; the spec recommends accepting 1.0 singles."""
+        data = json.loads(self.rpc.handle('{"method":"math.add","params":[3,3],"id":9}'))
+        self.assertEqual(data['result'], 6)
+        self.assertNotIn('jsonrpc', data)
+
+
+class TestDeeplyNestedBodyIsAParseError(unittest.TestCase):
+    def test_recursion_error_becomes_32700(self):
+        """Exhausting the parser's stack is a parse failure, not a server fault.
+
+        RecursionError is a RuntimeError, so it slipped past the parse handler
+        and became -32603 with a full traceback logged per request.
+        """
+        rpc = JSONRPC(version='2.0')
+        rpc.register('ping', NoParamsMethod())
+        body = '{"jsonrpc":"2.0","method":"ping","params":{"x":' + '[' * 20000 + ']' * 20000 + '},"id":1}'
+
+        data = json.loads(rpc.handle(body))
+
+        self.assertEqual(data['error']['code'], -32700)
+
+
+class TestAsyncBatchConcurrencyDefault(unittest.TestCase):
+    def test_the_default_limit_is_a_fixed_number(self):
+        """os.cpu_count() said nothing useful: a coroutine awaiting a socket
+        uses no CPU, so cores do not bound how many can wait at once."""
+        from jsonrpc.jsonrpc import DEFAULT_MAX_CONCURRENT
+
+        self.assertEqual(DEFAULT_MAX_CONCURRENT, 64)
+        self.assertEqual(JSONRPC()._effective_max_concurrent, 64)
+
+    def test_an_explicit_limit_still_wins(self):
+        self.assertEqual(JSONRPC(max_concurrent=8)._effective_max_concurrent, 8)
+        self.assertEqual(JSONRPC(max_concurrent=-1)._effective_max_concurrent, -1)
+
+
+# ==========================================================================
+# The worked examples from the specification
+#
+# https://www.jsonrpc.org/specification, section "Examples".
+#
+# Everything above was written by reading this implementation, which is how it
+# ended up agreeing with itself and disagreeing with the document. These are
+# transcribed from the specification instead: the request text is the one
+# printed there, and each case asserts the whole response rather than a field
+# of it. Where an example depends on a method the spec does not define, the
+# method here does exactly what its printed response implies and nothing more.
+# ==========================================================================
+
+
+@dataclass
+class SubtractParams:
+    """Named form of subtract, per the spec's own example."""
+
+    minuend: int
+    subtrahend: int
+
+
+@dataclass
+class NumbersParams:
+    numbers: list[int]
+
+
+@dataclass
+class OptionalNumbersParams:
+    """The spec's notify.hello is called both with and without params."""
+
+    numbers: list[int] = field(default_factory=list)
+
+
+class Subtract(Method):
+    def execute(self, params: SubtractParams) -> int:
+        return params.minuend - params.subtrahend
+
+
+class Update(Method):
+    def execute(self, params: NumbersParams) -> int:
+        return len(params.numbers)
+
+
+class Notify(Method):
+    def execute(self, params: OptionalNumbersParams) -> int:
+        return len(params.numbers)
+
+
+class Sum(Method):
+    def execute(self, params: NumbersParams) -> int:
+        return sum(params.numbers)
+
+
+class GetData(Method):
+    def execute(self, params: None) -> list:
+        return ['hello', 5]
+
+
+def build() -> JSONRPC:
+    rpc = JSONRPC(version='2.0')
+    rpc.register('subtract', Subtract())
+    rpc.register('update', Update())
+    rpc.register('sum', Sum())
+    rpc.register('get_data', GetData())
+
+    notify = MethodGroup()
+    notify.register('hello', Notify())
+    rpc.register('notify', notify)
+    return rpc
+
+
+class SpecExampleCase(unittest.TestCase):
+    def setUp(self):
+        self.rpc = build()
+
+    def assertResponse(self, request: str, expected: str) -> None:
+        """The whole response object must match, not merely some of its fields."""
+        actual = self.rpc.handle(request)
+        self.assertIsNotNone(actual, 'expected a response, got none')
+        self.assertEqual(json.loads(actual), json.loads(expected))
+
+    def assertNoResponse(self, request: str) -> None:
+        self.assertIsNone(self.rpc.handle(request))
+
+
+class TestPositionalParameters(SpecExampleCase):
+    """rpc call with positional parameters."""
+
+    def test_subtract_42_23(self):
+        self.assertResponse(
+            '{"jsonrpc": "2.0", "method": "subtract", "params": [42, 23], "id": 1}',
+            '{"jsonrpc": "2.0", "result": 19, "id": 1}',
+        )
+
+    def test_subtract_23_42(self):
+        self.assertResponse(
+            '{"jsonrpc": "2.0", "method": "subtract", "params": [23, 42], "id": 2}',
+            '{"jsonrpc": "2.0", "result": -19, "id": 2}',
+        )
+
+
+class TestNamedParameters(SpecExampleCase):
+    """rpc call with named parameters."""
+
+    def test_named_in_declaration_order(self):
+        self.assertResponse(
+            '{"jsonrpc": "2.0", "method": "subtract", "params": {"subtrahend": 23, "minuend": 42}, "id": 3}',
+            '{"jsonrpc": "2.0", "result": 19, "id": 3}',
+        )
+
+    def test_named_in_any_order(self):
+        self.assertResponse(
+            '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": 23}, "id": 4}',
+            '{"jsonrpc": "2.0", "result": 19, "id": 4}',
+        )
+
+
+class TestNotifications(SpecExampleCase):
+    """a Notification."""
+
+    def test_notification_with_params(self):
+        self.assertNoResponse('{"jsonrpc": "2.0", "method": "update", "params": {"numbers": [1,2,3,4,5]}}')
+
+    def test_notification_without_params(self):
+        self.assertNoResponse('{"jsonrpc": "2.0", "method": "notify.hello"}')
+
+
+class TestNonExistentMethod(SpecExampleCase):
+    """rpc call of non-existent method."""
+
+    def test_method_not_found(self):
+        response = json.loads(self.rpc.handle('{"jsonrpc": "2.0", "method": "foobar", "id": "1"}'))
+        self.assertEqual(response['jsonrpc'], '2.0')
+        self.assertEqual(response['id'], '1')
+        self.assertEqual(response['error']['code'], -32601)
+
+
+class TestInvalidJSON(SpecExampleCase):
+    """rpc call with invalid JSON."""
+
+    def test_parse_error(self):
+        request = '{"jsonrpc": "2.0", "method": "foobar, "params": "bar", "baz]'
+        response = json.loads(self.rpc.handle(request))
+        self.assertEqual(response['jsonrpc'], '2.0')
+        self.assertIsNone(response['id'])
+        self.assertEqual(response['error']['code'], -32700)
+
+
+class TestInvalidRequestObject(SpecExampleCase):
+    """rpc call with invalid Request object."""
+
+    def test_method_must_be_a_string(self):
+        response = json.loads(self.rpc.handle('{"jsonrpc": "2.0", "method": 1, "params": "bar"}'))
+        self.assertEqual(response['jsonrpc'], '2.0')
+        self.assertEqual(response['error']['code'], -32600)
+
+
+class TestBatchInvalidJSON(SpecExampleCase):
+    """rpc call Batch, invalid JSON."""
+
+    def test_one_parse_error_for_the_whole_batch(self):
+        request = """[
+          {"jsonrpc": "2.0", "method": "sum", "params": [1,2,4], "id": "1"},
+          {"jsonrpc": "2.0", "method"
+        ]"""
+        response = json.loads(self.rpc.handle(request))
+        self.assertEqual(response['jsonrpc'], '2.0')
+        self.assertIsNone(response['id'])
+        self.assertEqual(response['error']['code'], -32700)
+
+
+class TestEmptyArray(SpecExampleCase):
+    """rpc call with an empty Array."""
+
+    def test_empty_batch_is_one_invalid_request(self):
+        response = json.loads(self.rpc.handle('[]'))
+        self.assertEqual(response['jsonrpc'], '2.0')
+        self.assertIsNone(response['id'])
+        self.assertEqual(response['error']['code'], -32600)
+
+
+class TestInvalidBatch(SpecExampleCase):
+    """rpc call with an invalid Batch."""
+
+    def test_single_non_object_entry_answers_with_one_array_element(self):
+        response = json.loads(self.rpc.handle('[1]'))
+        self.assertIsInstance(response, list)
+        self.assertEqual(len(response), 1)
+        self.assertEqual(response[0]['error']['code'], -32600)
+        self.assertIsNone(response[0]['id'])
+
+    def test_three_non_object_entries_answer_with_three_array_elements(self):
+        response = json.loads(self.rpc.handle('[1,2,3]'))
+        self.assertIsInstance(response, list)
+        self.assertEqual(len(response), 3)
+        for entry in response:
+            self.assertEqual(entry['error']['code'], -32600)
+            self.assertIsNone(entry['id'])
+
+
+class TestBatch(SpecExampleCase):
+    """rpc call Batch - the mixed example from the specification."""
+
+    def test_the_batch_answers_only_the_requests(self):
+        request = """[
+            {"jsonrpc": "2.0", "method": "sum", "params": {"numbers": [1,2,4]}, "id": "1"},
+            {"jsonrpc": "2.0", "method": "notify.hello", "params": {"numbers": [7]}},
+            {"jsonrpc": "2.0", "method": "subtract", "params": [42,23], "id": "2"},
+            {"foo": "boo"},
+            {"jsonrpc": "2.0", "method": "foo.get", "params": {"name": "myself"}, "id": "5"},
+            {"jsonrpc": "2.0", "method": "get_data", "id": "9"}
+        ]"""
+        response = json.loads(self.rpc.handle(request))
+
+        self.assertIsInstance(response, list)
+        # One entry per request; the notification contributes nothing.
+        self.assertEqual(len(response), 5)
+
+        by_id = {entry.get('id'): entry for entry in response}
+        self.assertEqual(by_id['1']['result'], 7)
+        self.assertEqual(by_id['2']['result'], 19)
+        self.assertEqual(by_id['5']['error']['code'], -32601)
+        self.assertEqual(by_id['9']['result'], ['hello', 5])
+        # {"foo": "boo"} carries no id at all, so its error answers with null.
+        self.assertEqual(by_id[None]['error']['code'], -32600)
+
+    def test_every_entry_is_a_2_0_response(self):
+        request = """[
+            {"jsonrpc": "2.0", "method": "sum", "params": {"numbers": [1,2,4]}, "id": "1"},
+            {"jsonrpc": "2.0", "method": "subtract", "params": [42,23], "id": "2"}
+        ]"""
+        response = json.loads(self.rpc.handle(request))
+        for entry in response:
+            self.assertEqual(entry['jsonrpc'], '2.0')
+
+
+class TestBatchOfOnlyNotifications(SpecExampleCase):
+    """rpc call Batch (all notifications)."""
+
+    def test_nothing_is_returned(self):
+        request = """[
+            {"jsonrpc": "2.0", "method": "notify.hello", "params": {"numbers": [1,2,4]}},
+            {"jsonrpc": "2.0", "method": "notify.hello", "params": {"numbers": [7]}}
+        ]"""
+        self.assertIsNone(self.rpc.handle(request))
+
+
+class TestIdEchoing(SpecExampleCase):
+    """Section 5: the response id "MUST be the same as the value of the id member
+    in the Request Object", with null reserved for "an error in detecting the id".
+    """
+
+    def test_a_refused_request_still_carries_its_id(self):
+        response = json.loads(self.rpc.handle('{"jsonrpc": "2.0", "method": 1, "id": 77}'))
+        self.assertEqual(response['id'], 77)
+
+    def test_a_string_id_survives_as_a_string(self):
+        response = json.loads(self.rpc.handle('{"jsonrpc": "2.0", "method": "subtract", "params": [42,23], "id": "x"}'))
+        self.assertEqual(response['id'], 'x')
+
+    def test_an_id_that_cannot_be_detected_is_null(self):
+        response = json.loads(self.rpc.handle('{"jsonrpc": "2.0", "method": "subtract", "params": [1,2], "id": {}}'))
+        self.assertIsNone(response['id'])
 
 
 if __name__ == '__main__':

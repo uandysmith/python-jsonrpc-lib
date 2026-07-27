@@ -1,5 +1,6 @@
 """OpenAPI documentation generator for JSON-RPC methods."""
 
+import json
 import types
 from dataclasses import MISSING, fields, is_dataclass
 from typing import (
@@ -23,16 +24,56 @@ def _get_docstring(obj: Any) -> str | None:
     return None
 
 
-def _type_to_jsonschema(t: type, schemas: dict[str, Any]) -> dict[str, Any]:
+def _authored_docstring(dc: type) -> str | None:
+    """The dataclass's own docstring, or None if @dataclass generated it.
+
+    @dataclass fills __doc__ with the constructor signature when the author
+    wrote none, which then shipped in the public spec as the schema description:
+    `Outer(inner: __main__.Inner)`, module paths and all. An absent description
+    is better than one that reads like a leak.
+    """
+    doc = getattr(dc, '__doc__', None)
+    if not doc:
+        return None
+    stripped = doc.strip()
+    generated = stripped.startswith(f'{dc.__name__}(') and stripped.endswith(')') and '\n' not in stripped
+    return None if generated else stripped
+
+
+def _schema_name(t: type, registry: dict[type, str]) -> str:
+    """Pick the components/schemas key for a dataclass.
+
+    Short name while it is free, because that is what makes a spec readable.
+    Two different dataclasses that happen to share a name used to collide
+    silently: the second reused the first's schema, so one of the two methods
+    was documented with the other's fields. On a collision the loser gets its
+    module path prefixed - OpenAPI allows dots in schema names.
+    """
+    assigned = registry.get(t)
+    if assigned is not None:
+        return assigned
+
+    name = t.__name__
+    if name in registry.values():
+        name = f'{t.__module__}.{t.__qualname__}'
+    registry[t] = name
+    return name
+
+
+def _type_to_jsonschema(t: type, schemas: dict[str, Any], registry: dict[type, str] | None = None) -> dict[str, Any]:
     """Convert Python type annotation to JSON Schema.
 
     Args:
         t: Type annotation
         schemas: Dict to add nested schemas to
+        registry: Dataclass -> schema name, so two same-named dataclasses do not
+            share one entry
 
     Returns:
         JSON Schema dict
     """
+    if registry is None:
+        registry = {}
     origin = get_origin(t)
 
     if t is type(None):
@@ -43,9 +84,9 @@ def _type_to_jsonschema(t: type, schemas: dict[str, Any]) -> dict[str, Any]:
         # Check for Optional (T | None)
         if len(args) == 2 and type(None) in args:
             other = args[0] if args[1] is type(None) else args[1]
-            other_schema = _type_to_jsonschema(other, schemas)
+            other_schema = _type_to_jsonschema(other, schemas, registry)
             return {'oneOf': [other_schema, {'type': 'null'}]}
-        return {'oneOf': [_type_to_jsonschema(a, schemas) for a in args]}
+        return {'oneOf': [_type_to_jsonschema(a, schemas, registry) for a in args]}
 
     if origin is Literal:
         args = get_args(t)
@@ -56,7 +97,7 @@ def _type_to_jsonschema(t: type, schemas: dict[str, Any]) -> dict[str, Any]:
         if args:
             return {
                 'type': 'array',
-                'items': _type_to_jsonschema(args[0], schemas),
+                'items': _type_to_jsonschema(args[0], schemas, registry),
             }
         return {'type': 'array'}
 
@@ -65,7 +106,7 @@ def _type_to_jsonschema(t: type, schemas: dict[str, Any]) -> dict[str, Any]:
         if args and len(args) == 2:
             return {
                 'type': 'object',
-                'additionalProperties': _type_to_jsonschema(args[1], schemas),
+                'additionalProperties': _type_to_jsonschema(args[1], schemas, registry),
             }
         return {'type': 'object'}
 
@@ -81,24 +122,32 @@ def _type_to_jsonschema(t: type, schemas: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     if is_dataclass(t) and isinstance(t, type):
-        schema_name = t.__name__
+        schema_name = _schema_name(t, registry)
         if schema_name not in schemas:
-            schemas[schema_name] = _dataclass_to_jsonschema(t, schemas)
+            # Reserve the key before recursing: a self-referencing dataclass
+            # would otherwise recurse forever.
+            schemas[schema_name] = {}
+            schemas[schema_name] = _dataclass_to_jsonschema(t, schemas, registry)
         return {'$ref': f'#/components/schemas/{schema_name}'}
 
     return {}
 
 
-def _dataclass_to_jsonschema(dc: type, schemas: dict[str, Any]) -> dict[str, Any]:
+def _dataclass_to_jsonschema(
+    dc: type, schemas: dict[str, Any], registry: dict[type, str] | None = None
+) -> dict[str, Any]:
     """Convert dataclass to JSON Schema.
 
     Args:
         dc: Dataclass type
         schemas: Dict to add nested schemas to
+        registry: Dataclass -> schema name mapping (see _schema_name)
 
     Returns:
         JSON Schema dict
     """
+    if registry is None:
+        registry = {}
     if not is_dataclass(dc):
         raise ValueError(f'Expected dataclass, got {type(dc).__name__}')
 
@@ -110,7 +159,7 @@ def _dataclass_to_jsonschema(dc: type, schemas: dict[str, Any]) -> dict[str, Any
 
     for f in field_list:
         field_type = type_hints.get(f.name, Any)
-        field_schema = _type_to_jsonschema(field_type, schemas)
+        field_schema = _type_to_jsonschema(field_type, schemas, registry)
 
         if f.metadata and 'description' in f.metadata:
             field_schema['description'] = f.metadata['description']
@@ -128,7 +177,7 @@ def _dataclass_to_jsonschema(dc: type, schemas: dict[str, Any]) -> dict[str, Any
     if required:
         schema['required'] = required
 
-    doc = _get_docstring(dc)
+    doc = _authored_docstring(dc)
     if doc:
         schema['description'] = doc
 
@@ -283,6 +332,7 @@ class OpenAPIGenerator:
         paths: dict[str, Any],
         tags: list[dict[str, str]],
         seen_tags: set[str],
+        registry: dict[type, str],
     ) -> None:
         """Recursively generate OpenAPI entries from group tree.
 
@@ -296,6 +346,7 @@ class OpenAPIGenerator:
             paths: Paths dict to populate
             tags: Tags list to populate
             seen_tags: Set of seen tag names
+            registry: Dataclass -> schema name mapping, shared across the tree
         """
         tag_name = prefix if prefix else 'default'
         if tag_name not in seen_tags:
@@ -310,11 +361,11 @@ class OpenAPIGenerator:
             method_path = self._construct_method_path(prefix, method_name)
 
             # Generate request schema
-            request_schema = self._generate_method_request_schema(full_name, method, schemas)
+            request_schema = self._generate_method_request_schema(full_name, method, schemas, registry)
             schemas[f'{full_name}_request'] = request_schema
 
             # Generate response schema
-            response_schema = self._generate_method_response_schema(full_name, method, schemas)
+            response_schema = self._generate_method_response_schema(full_name, method, schemas, registry)
             schemas[f'{full_name}_response'] = response_schema
 
             operation: dict[str, Any] = {
@@ -351,7 +402,7 @@ class OpenAPIGenerator:
         # Recurse into subgroups
         for subgroup_name, subgroup in group.get_all_groups().items():
             new_prefix = f'{prefix}.{subgroup_name}' if prefix else subgroup_name
-            self._generate_from_group(subgroup, new_prefix, schemas, paths, tags, seen_tags)
+            self._generate_from_group(subgroup, new_prefix, schemas, paths, tags, seen_tags, registry)
 
     def generate(self) -> dict[str, Any]:
         """Generate OpenAPI 3.0 specification with per-method paths.
@@ -366,10 +417,11 @@ class OpenAPIGenerator:
         paths: dict[str, Any] = {}
         tags: list[dict[str, str]] = []
         seen_tags: set[str] = set()
+        registry: dict[type, str] = {}
 
         # Generate paths and schemas by traversing group tree
         root_group = self.rpc.get_root_group()
-        self._generate_from_group(root_group, '', schemas, paths, tags, seen_tags)
+        self._generate_from_group(root_group, '', schemas, paths, tags, seen_tags, registry)
 
         # Build OpenAPI spec
         spec: dict[str, Any] = {
@@ -432,6 +484,7 @@ class OpenAPIGenerator:
         full_name: str,
         method: Any,
         schemas: dict[str, Any],
+        registry: dict[type, str],
     ) -> dict[str, Any]:
         """Generate JSON Schema for method request."""
         schema: dict[str, Any] = {
@@ -449,7 +502,7 @@ class OpenAPIGenerator:
             schema['description'] = doc
 
         if method.params_type is not None and method.params_type is not type(None):
-            params_schema = _dataclass_to_jsonschema(method.params_type, schemas)
+            params_schema = _dataclass_to_jsonschema(method.params_type, schemas, registry)
             schema['properties']['params'] = params_schema
             schema['required'].append('params')
 
@@ -460,6 +513,7 @@ class OpenAPIGenerator:
         full_name: str,
         method: Any,
         schemas: dict[str, Any],
+        registry: dict[type, str],
     ) -> dict[str, Any]:
         """Generate JSON Schema for method response."""
         schema: dict[str, Any] = {
@@ -473,7 +527,7 @@ class OpenAPIGenerator:
         }
 
         if method.result_type is not None:
-            result_schema = _type_to_jsonschema(method.result_type, schemas)
+            result_schema = _type_to_jsonschema(method.result_type, schemas, registry)
             schema['properties']['result'] = result_schema
         else:
             schema['properties']['result'] = {}  # Any type
@@ -483,13 +537,23 @@ class OpenAPIGenerator:
     def generate_json(self, indent: int = 2) -> str:
         """Generate OpenAPI spec as JSON string.
 
+        Deliberately json.dumps and not `self.rpc.serialize()`. That hook exists
+        to encode a *response* - it is documented as overridable with a narrower
+        signature, `def serialize(self, data)`, and with libraries such as orjson
+        that have no `indent` keyword at all. Passing indent into it made every
+        such override raise TypeError here, on a call the author never made.
+
+        A spec is not a response either: it is this generator's own output, plain
+        dicts and strings by construction, with nothing for a custom encoder to
+        do.
+
         Args:
             indent: JSON indentation level
 
         Returns:
             JSON string
         """
-        return self.rpc.serialize(self.generate(), indent=indent)
+        return json.dumps(self.generate(), indent=indent)
 
     def generate_yaml(self) -> str:
         """Generate OpenAPI spec as YAML string.

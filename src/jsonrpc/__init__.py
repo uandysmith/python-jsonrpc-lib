@@ -39,20 +39,21 @@ from .errors import (
     ServerError,
 )
 from .jsonrpc import JSONRPC
-from .method import Method, MethodGroup
+from .method import CallInfo, Method, MethodGroup
 from .openapi import OpenAPIGenerator
 from .request import build_notification, build_request, parse_request
 from .response import build_error_response, build_response, parse_response
 from .types import ErrorResponse, Request, Response, Version
 from .validation import validate_params, validate_result_type
 
-__version__ = '0.3.2'
+__version__ = '0.4.0'
 
 __all__ = [
     # Main classes
     'JSONRPC',
     'Method',
     'MethodGroup',
+    'CallInfo',
     # Types
     'Request',
     'Response',

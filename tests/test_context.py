@@ -747,5 +747,192 @@ class TestContextBackwardCompatibility(unittest.TestCase):
         self.assertEqual(result, 42)
 
 
+class TestContextTypeIsCheckedAtMount(unittest.TestCase):
+    """The registration-time context gate has to cover nested methods too.
+
+    A plain MethodGroup has context_type None, so the group-level check is
+    structurally vacuous for it, and the RPC-level check compares only the
+    group's own type and never reaches the methods inside. The check that
+    actually covers the tree runs when the subtree is mounted.
+    """
+
+    def setUp(self):
+        @dataclass
+        class WeakParams:
+            value: int
+
+        class WeakMethod(Method):
+            """Declares a weaker context type than the RPC promises."""
+
+            def execute(self, params: WeakParams, context: BaseContext) -> int:
+                return params.value
+
+        class StrictMethod(Method):
+            def execute(self, params: WeakParams, context: SuperAdminContext) -> int:
+                return params.value
+
+        self.WeakMethod = WeakMethod
+        self.StrictMethod = StrictMethod
+
+    def test_direct_registration_is_refused(self):
+        rpc = JSONRPC(context_type=AdminContext)
+        with self.assertRaises(TypeError):
+            rpc.register('weak', self.WeakMethod())
+
+    def test_registration_inside_a_plain_group_is_refused_too(self):
+        rpc = JSONRPC(context_type=AdminContext)
+        group = MethodGroup()
+        group.register('weak', self.WeakMethod())
+
+        with self.assertRaises(TypeError) as ctx:
+            rpc.register('api', group)
+        self.assertIn('must be subclass of RPC context_type', str(ctx.exception))
+
+    def test_registration_deep_inside_a_tree_is_refused(self):
+        rpc = JSONRPC(context_type=AdminContext)
+        leaf = MethodGroup()
+        leaf.register('weak', self.WeakMethod())
+        mid = MethodGroup()
+        mid.register('leaf', leaf)
+
+        with self.assertRaises(TypeError):
+            rpc.register('api', mid)
+
+    def test_a_method_added_after_mount_is_checked(self):
+        rpc = JSONRPC(context_type=AdminContext)
+        group = MethodGroup()
+        rpc.register('api', group)
+
+        with self.assertRaises(TypeError):
+            group.register('weak', self.WeakMethod())
+
+    def test_a_failed_registration_leaves_no_partial_state(self):
+        rpc = JSONRPC(context_type=AdminContext)
+        group = MethodGroup()
+        rpc.register('api', group)
+        method = self.WeakMethod()
+
+        with self.assertRaises(TypeError):
+            group.register('weak', method)
+
+        self.assertEqual(rpc.list_methods(), [])
+        self.assertIsNone(method._owner)
+
+    def test_a_narrower_context_type_is_accepted(self):
+        rpc = JSONRPC(context_type=AdminContext)
+        group = MethodGroup()
+        group.register('strict', self.StrictMethod())
+        rpc.register('api', group)
+
+        context = SuperAdminContext(request_id='r1', user_id=1, role='admin', can_delete=True)
+        result = rpc.call_method('api.strict', {'value': 42}, context=context)
+        self.assertEqual(result, 42)
+
+
+class TestAroundCallContext(unittest.TestCase):
+    """Context handling in the around_call chain.
+
+    around_call() replaced execute_method() as the hook for middleware, so the
+    same rules have to hold for it: the context annotation declares the group's
+    context_type and is checked at registration, and a group may hand the rest
+    of the chain a different context.
+    """
+
+    def test_the_annotation_is_extracted(self):
+        class Guard(MethodGroup):
+            def around_call(self, call, context: AdminContext, call_next):
+                return call_next(context)
+
+        self.assertIs(Guard.context_type, AdminContext)
+
+    def test_the_async_hook_alone_is_enough(self):
+        class Guard(MethodGroup):
+            async def around_call_async(self, call, context: AdminContext, call_next):
+                return await call_next(context)
+
+        self.assertIs(Guard.context_type, AdminContext)
+
+    def test_an_unannotated_hook_declares_nothing(self):
+        class Guard(MethodGroup):
+            def around_call(self, call, context, call_next):
+                return call_next(context)
+
+        self.assertIsNone(Guard.context_type)
+
+    def test_a_hook_without_a_context_parameter_declares_nothing(self):
+        """The extraction keys on the parameter being named `context`."""
+
+        class Renamed(MethodGroup):
+            def around_call(self, call, ctx, call_next):
+                return call_next(ctx)
+
+        self.assertIsNone(Renamed.context_type)
+        self.assertTrue(Renamed.accepts_context_param)
+
+    def test_around_call_never_reports_that_it_blocks_context(self):
+        """Only execute_method() decides whether a method can be handed a context."""
+
+        class Guard(MethodGroup):
+            def around_call(self, call, context: AdminContext, call_next):
+                return call_next(context)
+
+        self.assertTrue(Guard.accepts_context_param)
+
+    def test_a_method_demanding_a_weaker_context_is_refused(self):
+        @dataclass
+        class Params:
+            value: int
+
+        class AdminGuard(MethodGroup):
+            def around_call(self, call, context: AdminContext, call_next):
+                return call_next(context)
+
+        class WeakMethod(Method):
+            def execute(self, params: Params, context: BaseContext) -> int:
+                return params.value
+
+        with self.assertRaises(TypeError) as ctx:
+            AdminGuard().register('weak', WeakMethod())
+        self.assertIn('must be subclass of group context_type', str(ctx.exception))
+
+    def test_a_method_demanding_a_narrower_context_is_accepted(self):
+        @dataclass
+        class Params:
+            value: int
+
+        class Guard(MethodGroup):
+            def around_call(self, call, context: BaseContext, call_next):
+                return call_next(context)
+
+        class AdminMethod(Method):
+            def execute(self, params: Params, context: AdminContext) -> int:
+                return params.value
+
+        Guard().register('admin', AdminMethod())  # must not raise
+
+    def test_a_replaced_context_reaches_the_method(self):
+        @dataclass
+        class Params:
+            value: int
+
+        class PromotingGroup(MethodGroup):
+            def around_call(self, call, context: BaseContext, call_next):
+                return call_next(AdminContext(request_id=context.request_id, user_id=7, role='admin'))
+
+        class WhoAmI(Method):
+            def execute(self, params: Params, context: AdminContext) -> str:
+                return f'{context.request_id}:{context.user_id}:{context.role}'
+
+        leaf = MethodGroup()
+        leaf.register('whoami', WhoAmI())
+        promoting = PromotingGroup()
+        promoting.register('v1', leaf)
+        rpc = JSONRPC()
+        rpc.register('api', promoting)
+
+        result = rpc.call_method('api.v1.whoami', {'value': 1}, context=BaseContext(request_id='r1'))
+        self.assertEqual(result, 'r1:7:admin')
+
+
 if __name__ == '__main__':
     unittest.main()

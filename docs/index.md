@@ -75,7 +75,7 @@ The decorator is great for getting started. For production, `Method` classes giv
 
 ```python title="production.py"
 from dataclasses import dataclass
-from jsonrpc import JSONRPC, Method
+from jsonrpc import JSONRPC, Method, MethodGroup
 
 @dataclass
 class AddParams:
@@ -86,8 +86,11 @@ class AddMethod(Method):
     def execute(self, params: AddParams) -> int:
         return params.a + params.b
 
+math = MethodGroup()
+math.register('add', AddMethod())
+
 rpc = JSONRPC(version='2.0')
-rpc.register('math.add', AddMethod())
+rpc.register('math', math)          # the method is now "math.add"
 ```
 
 The `AddParams` dataclass is the contract between the caller and the method. Validation, IDE autocomplete, and OpenAPI schema all come from the same definition.

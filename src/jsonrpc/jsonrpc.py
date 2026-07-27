@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import json
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import field, fields, make_dataclass
 from typing import Any, cast, get_type_hints
@@ -15,14 +14,80 @@ from .errors import (
     JSONRPCError,
     MethodNotFoundError,
     ParseError,
+    _DispatchWiringError,
 )
-from .method import Method, MethodGroup
-from .request import parse_request
+from .method import Method, MethodGroup, _check_unowned, _invalidate_routes
+from .request import parse_request, recover_request_id
 from .response import _dataclass_to_dict, build_error_response, build_response
 from .types import Request, Version
 from .validation import is_batch
 
 logger = logging.getLogger('jsonrpc-lib')
+
+# Concurrency cap for an async batch. The previous default was os.cpu_count(),
+# which is a category error: a coroutine awaiting a socket consumes no CPU, so
+# the number of cores says nothing about how many can wait at once. On a 4-core
+# machine that turned a 100-call I/O batch into 25 sequential rounds.
+#
+# 64 sits below max_batch=100, so the limiter still does its job and one batch
+# cannot open a hundred sockets at once, while typical client pools (httpx 10,
+# aiohttp 100, asyncpg 10-20) survive a single batch. Hosts with a smaller pool
+# should set it explicitly.
+DEFAULT_MAX_CONCURRENT = 64
+
+# Largest body accepted by default, refused before it is parsed.
+#
+# 1 MiB is far above any hand-written JSON-RPC call and far below the point where
+# a body costs real time: the amplification is in the validator, not the parser,
+# because _coerce builds a new list for a `list[int]` on top of the one
+# json.loads already built. 16.9 MB of integers measured 6.9 seconds of solid
+# CPU and 90 MB of heap - and under handle_async() that is the whole event loop,
+# since nothing on the validation path awaits.
+#
+# It belongs here as well as in the transport because this is the layer that
+# knows the params are a list of two million things. A host that legitimately
+# receives more should raise it deliberately.
+DEFAULT_MAX_REQUEST_SIZE = 1024 * 1024
+
+
+def _reject_constant(name: str) -> Any:
+    """parse_constant hook: refuse the non-standard JSON tokens."""
+    raise ValueError(f'{name} is not valid JSON')
+
+
+# One shared decoder and encoder. json.loads()/json.dumps() keep a cached
+# instance only for fully default arguments; passing any option makes them build
+# a fresh one on every single call, which is very visible on the request path.
+_strict_decoder = json.JSONDecoder(parse_constant=_reject_constant)
+_strict_encoder = json.JSONEncoder(allow_nan=False)
+
+
+def _require_request_object(data: Any) -> None:
+    """Reject anything that is not a JSON object before it reaches parse_request().
+
+    parse_request() accepts a `str` and runs json.loads() on it, which is right
+    for its public client-side use but wrong here: it means a body consisting of
+    a JSON *string* that happens to contain a request gets unwrapped and
+    executed. The request is then invisible to anything that inspected the body
+    as JSON (it saw a string, with no method member), and the second parse also
+    happens below the deserialize() hook, so a host that replaced the parser to
+    add limits or a different library does not get either.
+    """
+    if not isinstance(data, dict):
+        raise InvalidRequestError(f'Request must be a JSON object, got {type(data).__name__}')
+
+
+def _require_v2_batch_entry(data: dict[str, Any]) -> None:
+    """Reject a batch entry that is not a 2.0 Request object.
+
+    Batching exists only in 2.0 - section 6 says the array is "filled with
+    Request objects", which in that document means 2.0 requests. A 1.0-framed
+    entry used to be accepted and answered in 1.0 framing, producing an array
+    that mixed two response shapes. Single requests still accept 1.0 framing,
+    which is what the spec's compatibility note actually recommends.
+    """
+    if data.get('jsonrpc') != '2.0':
+        raise InvalidRequestError('Batch entries must be JSON-RPC 2.0 requests with "jsonrpc": "2.0"')
 
 
 def _validate_decorator_function(func: Callable[..., Any], sig: inspect.Signature, hints: dict[str, Any]) -> None:
@@ -171,7 +236,10 @@ class JSONRPC:
         allow_dict_params: bool | None = None,
         allow_list_params: bool | None = None,
         max_batch: int = 100,
+        max_request_size: int = DEFAULT_MAX_REQUEST_SIZE,
+        max_batch_size: int = -1,
         max_concurrent: int | None = None,
+        expose_internal_errors: bool = False,
     ) -> None:
         """Initialize JSON-RPC handler.
 
@@ -183,8 +251,25 @@ class JSONRPC:
             allow_dict_params: Allow dict/object params (None = spec-compliant default)
             allow_list_params: Allow array params (None = spec-compliant default)
             max_batch: Maximum number of requests in a batch (-1 for unlimited, default: 100)
-            max_concurrent: Maximum concurrent coroutines in async batch (None = os.cpu_count(),
+            max_request_size: Largest body accepted, refused before it is parsed
+                (-1 for unlimited, default: 1 MiB). max_batch bounds how many
+                requests a batch holds and nothing bounded how large they are:
+                one 16.9 MB body of 2 million integers took 6.9 seconds of solid
+                CPU and 90 MB of heap, and under handle_async() that is the whole
+                event loop, because validation has no await in it. Measured in
+                bytes for bytes input and in characters for str - by the time you
+                hold a str, whoever decoded it has already paid for the bytes.
+            max_batch_size: Same, but applied only when the body is a batch
+                (-1 = only max_request_size applies, the default). For a host
+                that raises max_request_size for one legitimately large method
+                and does not want that headroom multiplied by max_batch.
+            max_concurrent: Maximum concurrent coroutines in an async batch (None = 64,
                 -1 for unlimited, default: None). Sync batch is unaffected.
+            expose_internal_errors: If True, the text of an unhandled exception is sent to the
+                caller in the -32603 message. Default False: the caller gets a bare
+                'Internal error' and the full exception goes to the log. Errors a method raises
+                deliberately (JSONRPCError subclasses) are never affected - they are the
+                application's own wire vocabulary.
 
         Defaults (spec-compliant):
             v1.0: allow_batch=False, allow_dict_params=False, allow_list_params=True
@@ -196,11 +281,18 @@ class JSONRPC:
         if max_concurrent is not None and max_concurrent != -1 and max_concurrent < 1:
             raise ValueError(f'max_concurrent must be -1 (unlimited) or >= 1, got {max_concurrent}')
 
+        for name, limit in (('max_request_size', max_request_size), ('max_batch_size', max_batch_size)):
+            if limit != -1 and limit < 1:
+                raise ValueError(f'{name} must be -1 (unlimited) or >= 1, got {limit}')
+
         self.version = version
         self.validate_results = validate_results
         self.context_type = context_type
         self.max_batch = max_batch
+        self.max_request_size = max_request_size
+        self.max_batch_size = max_batch_size
         self.max_concurrent = max_concurrent
+        self.expose_internal_errors = expose_internal_errors
 
         if allow_batch is None:
             self.allow_batch = version == '2.0'
@@ -220,13 +312,28 @@ class JSONRPC:
         if max_concurrent is not None:
             self._effective_max_concurrent = max_concurrent
         else:
-            self._effective_max_concurrent = os.cpu_count() or 4
+            self._effective_max_concurrent = DEFAULT_MAX_CONCURRENT
 
         self._root_group = MethodGroup()
         self._root_group._name = None
         self._root_group._inject_rpc(self)
 
-        self._has_direct_root_methods = False
+        # register(name, method) puts methods in this group. Kept so that
+        # register(None, group) can tell "you have registered methods directly"
+        # apart from "you already installed a root group", which needs a
+        # different sentence and is no longer true once the group is replaced.
+        self._implicit_root_group = self._root_group
+
+    def _internal_error_message(self, exc: BaseException) -> str:
+        """Message for a -32603 built from an exception the library caught.
+
+        The exception text is written by code that never expected to be read by a
+        caller: connection strings, SQL fragments, file paths. It is always logged;
+        whether it also goes on the wire is the host's decision.
+        """
+        if self.expose_internal_errors or isinstance(exc, _DispatchWiringError):
+            return str(exc)
+        return InternalError.message
 
     def deserialize(self, data: str | bytes) -> Any:
         """Deserialize incoming JSON to a Python object.
@@ -240,14 +347,48 @@ class JSONRPC:
             ...     def deserialize(self, data):
             ...         return orjson.loads(data)
 
-        Default: json.loads(data) from the standard library.
+        Default: a strict json.loads() - `bytes` must be UTF-8 (no encoding
+        sniffing), and the non-standard tokens NaN, Infinity and -Infinity are
+        rejected, because none of them exist in the JSON grammar and a value
+        built from them cannot be serialized back into valid JSON.
+
+        A body nested deeply enough to exhaust the interpreter's stack raises
+        RecursionError here; the callers treat it as the parse failure it is.
         """
-        return json.loads(data)
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode('utf-8')
+        return _strict_decoder.decode(data)
 
     def serialize(self, data: Any, **kwargs: Any) -> str:
         """Serialize a response dict (or list of dicts for batch) to a JSON string.
 
-        Override to substitute a faster JSON library:
+        This is also where custom types are handled. It is the last step, so it
+        sees the whole payload however deeply the value was nested:
+
+        Example:
+            >>> from datetime import datetime
+            >>> from decimal import Decimal
+            >>> from enum import Enum
+            >>>
+            >>> def encode(value):
+            ...     if isinstance(value, datetime):
+            ...         return value.isoformat()
+            ...     if isinstance(value, Decimal):
+            ...         return str(value)
+            ...     if isinstance(value, Enum):
+            ...         return value.value
+            ...     raise TypeError(f'{type(value).__name__} is not JSON serializable')
+            >>>
+            >>> class MyRPC(JSONRPC):
+            ...     def serialize(self, data, **kwargs):
+            ...         kwargs.setdefault('allow_nan', False)  # keep the NaN guard
+            ...         return json.dumps(data, default=encode, **kwargs)
+
+        Note the `allow_nan=False`: overriding this method replaces the default
+        that rejects non-finite floats, and without it NaN and Infinity go back
+        on the wire as bare tokens no conforming parser accepts.
+
+        Or to substitute a faster JSON library:
 
         Example:
             >>> import orjson
@@ -255,17 +396,33 @@ class JSONRPC:
             ...     def serialize(self, data):
             ...         return orjson.dumps(data).decode()
 
-        Default: json.dumps(data) from the standard library.
+        This hook covers the outbound direction only. Parameters arriving as
+        JSON have no equivalent - convert them in the params dataclass's
+        __post_init__ instead.
+
+        Default: json.dumps(data) with allow_nan disabled, so a non-finite float
+        raises here instead of emitting the bare tokens NaN / Infinity, which no
+        conforming JSON parser accepts.
         """
+        if not kwargs:
+            return _strict_encoder.encode(data)
+        kwargs.setdefault('allow_nan', False)
         return json.dumps(data, **kwargs)
 
     def serialize_result(self, result: Any) -> Any:
-        """Convert method result to a JSON-serializable value.
+        """Convert a method result into plain dicts, lists and scalars.
 
-        Override to customize serialization of custom types (datetime, Decimal, etc.)
-        or to replace the default dataclass conversion with a faster alternative.
+        This hook is the dataclass-to-dict conversion itself - override it to
+        replace that walk with a faster one, not to add support for a type.
 
-        Default: recursively converts dataclass instances to dicts via dataclasses.asdict().
+        Adding a type here does not work the way it looks: by the time
+        super().serialize_result() returns, the value is already a plain dict
+        and whatever custom object was nested inside it is still there,
+        untouched, with nowhere left to intercept it. Handle custom types in
+        serialize() instead, which sees the whole payload - see its docstring
+        for the recipe.
+
+        Default: recursively converts dataclass instances to dicts.
 
         Args:
             result: Raw method return value
@@ -274,13 +431,9 @@ class JSONRPC:
             JSON-serializable value
 
         Example:
-            >>> class MyRPC(JSONRPC):
+            >>> class FastRPC(JSONRPC):
             ...     def serialize_result(self, result):
-            ...         if isinstance(result, datetime):
-            ...             return result.isoformat()
-            ...         if isinstance(result, Decimal):
-            ...             return str(result)
-            ...         return super().serialize_result(result)
+            ...         return my_faster_dataclass_walk(result)
         """
         return _dataclass_to_dict(result)
 
@@ -330,7 +483,15 @@ class JSONRPC:
                     f"Use a non-empty name: register('method_name', {type(target).__name__}())"
                 )
 
-            if self._has_direct_root_methods:
+            # Fail-fast: the group must not already be mounted somewhere else,
+            # or the two instances end up sharing one method table.
+            _check_unowned(target)
+
+            # Asked of the group rather than remembered from register(), because
+            # a flag set on the way in was never cleared on the way out: after
+            # unregistering every root method the error still fired, and it told
+            # the caller to clear methods they had already cleared.
+            if self._root_group is self._implicit_root_group and self._root_group._methods:
                 raise ValueError(
                     'Cannot register explicit root group: root already has directly '
                     'registered methods. Clear them first or use named groups.'
@@ -338,33 +499,21 @@ class JSONRPC:
             if self._root_group._methods or self._root_group._subgroups:
                 raise ValueError('Root group already exists with methods/subgroups')
 
-            target._inject_rpc(self)
             target._name = None
+            target._owner = None
+            target._mount(self)
             self._root_group = target
+            # The subtree's own routes are still correct - mounting changes no
+            # shape - but the group that was root until this line is not this
+            # tree's root any more, and neither is its cache.
+            _invalidate_routes(target)
             return
 
         if isinstance(target, Method):
             if '.' in name:
                 raise ValueError(f"Method name cannot contain '.': '{name}'")
 
-            # Fail-fast: check if method is already registered elsewhere
-            if hasattr(target, 'rpc'):
-                raise ValueError(
-                    f"Method instance '{target.__class__.__name__}' is already registered "
-                    f'in another JSONRPC/MethodGroup. Create a new instance for each registration.'
-                )
-
-            if target.accepts_context and target.context_type is not None and self.context_type is not None:
-                if not issubclass(target.context_type, self.context_type):
-                    raise TypeError(
-                        f'Cannot register {target.__class__.__name__}: '
-                        f'method context_type {target.context_type.__name__} must be '
-                        f'subclass of RPC context_type {self.context_type.__name__}'
-                    )
-
-            target.rpc = self
-            self._root_group._methods[name] = target
-            self._has_direct_root_methods = True
+            self._root_group.register(name, target)
             return
 
         if isinstance(target, MethodGroup):
@@ -379,7 +528,6 @@ class JSONRPC:
                         f'subclass of RPC context_type {self.context_type.__name__}'
                     )
 
-            target._inject_rpc(self)
             self._root_group.register(name, target)
             return
 
@@ -425,6 +573,36 @@ class JSONRPC:
         """
         return self._root_group
 
+    def _too_large(self, raw_data: Any) -> JSONRPCError | None:
+        """Refuse an oversized body before anything has looked at it.
+
+        Before parsing, deliberately: the parse is where the cost starts, and a
+        body this layer will not serve should not be turned into objects first.
+
+        The id is unknown here and the response carries `id: null` - the one
+        case the spec sanctions it, since nothing has read the request yet.
+        Applied to the whole body rather than per batch entry, so a batch keeps
+        its per-entry receipts.
+        """
+        return self._over(raw_data, self.max_request_size, 'Request', 'request_too_large')
+
+    def _batch_too_large(self, raw_data: Any) -> JSONRPCError | None:
+        return self._over(raw_data, self.max_batch_size, 'Batch', 'batch_too_large')
+
+    def _over(self, raw_data: Any, limit: int, noun: str, reason: str) -> JSONRPCError | None:
+        if limit == -1 or not isinstance(raw_data, (str, bytes, bytearray)):
+            # Anything else is deserialize()'s problem to describe, and a custom
+            # deserialize() may legitimately be handed something with no length.
+            return None
+        size = len(raw_data)
+        if size <= limit:
+            return None
+        logger.info('%s of %d bytes refused: over the %d limit', noun, size, limit)
+        return InvalidRequestError(
+            f'{noun} too large: {size} bytes, maximum is {limit}',
+            data={'reason': reason, 'limit': limit, 'received': size},
+        )
+
     def handle(self, raw_data: str | bytes, context: Any = None) -> str | None:
         """Process incoming JSON-RPC message and return response.
 
@@ -436,9 +614,13 @@ class JSONRPC:
             JSON response string, or None for notifications
         """
         try:
+            oversized = self._too_large(raw_data)
+            if oversized is not None:
+                return self.serialize(build_error_response(oversized, None, self.version))
+
             try:
                 data = self.deserialize(raw_data)
-            except (json.JSONDecodeError, TypeError, ValueError) as e:
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as e:
                 err: JSONRPCError = ParseError(f'Invalid JSON: {e}')
                 response = build_error_response(err, None, self.version)
                 return self.serialize(response)
@@ -448,13 +630,16 @@ class JSONRPC:
                     err = InvalidRequestError('Batch requests not allowed')
                     response = build_error_response(err, None, self.version)
                     return self.serialize(response)
+                oversized = self._batch_too_large(raw_data)
+                if oversized is not None:
+                    return self.serialize(build_error_response(oversized, None, self.version))
                 return self._handle_batch(data, context=context)
 
             return self._handle_single(data, context=context)
 
         except Exception as e:
             logger.error('Unhandled exception in handle()', exc_info=True)
-            err = InternalError(str(e))
+            err = InternalError(self._internal_error_message(e))
             response = build_error_response(err, None, self.version)
             return self.serialize(response)
 
@@ -469,9 +654,13 @@ class JSONRPC:
             JSON response string, or None for notifications
         """
         try:
+            oversized = self._too_large(raw_data)
+            if oversized is not None:
+                return self.serialize(build_error_response(oversized, None, self.version))
+
             try:
                 data = self.deserialize(raw_data)
-            except (json.JSONDecodeError, TypeError, ValueError) as e:
+            except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as e:
                 err: JSONRPCError = ParseError(f'Invalid JSON: {e}')
                 response = build_error_response(err, None, self.version)
                 return self.serialize(response)
@@ -481,22 +670,32 @@ class JSONRPC:
                     err = InvalidRequestError('Batch requests not allowed')
                     response = build_error_response(err, None, self.version)
                     return self.serialize(response)
+                oversized = self._batch_too_large(raw_data)
+                if oversized is not None:
+                    return self.serialize(build_error_response(oversized, None, self.version))
                 return await self._handle_batch_async(data, context=context)
 
             return await self._handle_single_async(data, context=context)
 
         except Exception as e:
             logger.error('Unhandled exception in handle_async()', exc_info=True)
-            err = InternalError(str(e))
+            err = InternalError(self._internal_error_message(e))
             response = build_error_response(err, None, self.version)
             return self.serialize(response)
 
-    def _process_single(self, data: dict[str, Any], context: Any = None) -> dict[str, Any] | None:
+    def _process_single(
+        self, data: dict[str, Any], context: Any = None, in_batch: bool = False
+    ) -> dict[str, Any] | None:
         """Process a single request and return response as dict (or None for notifications)."""
         request_id: str | int | None = None
         version = self.version
+        method_name: str | None = None
 
         try:
+            _require_request_object(data)
+            if in_batch:
+                _require_v2_batch_entry(data)
+
             parsed = parse_request(
                 data,
                 allow_dict_params=self.allow_dict_params,
@@ -506,6 +705,7 @@ class JSONRPC:
             request = cast(Request, parsed)
             request_id = request.id
             version = request.version
+            method_name = request.method
 
             if request.is_notification:
                 try:
@@ -517,7 +717,7 @@ class JSONRPC:
                         context=context,
                     )
                 except Exception:
-                    logger.debug('Notification error suppressed (per JSON-RPC spec)', exc_info=True)
+                    logger.warning('Notification failed, error suppressed per JSON-RPC spec', exc_info=True)
                 return None
 
             result = self._root_group.dispatch(
@@ -529,21 +729,37 @@ class JSONRPC:
             )
 
             serialized = self.serialize_result(result)
-            return build_response(serialized, request_id, version)  # type: ignore[arg-type]
+            return build_response(serialized, request_id, version)
 
         except JSONRPCError as e:
+            if request_id is None:
+                # The request never parsed, so request.id was never read. The id
+                # may still be right there in the payload - echo it, or the
+                # caller cannot match this answer to the call it made.
+                request_id = recover_request_id(data)
+            # The refusal arm used to write nothing at any level, which left an
+            # operator no way to see method enumeration, params probing or a
+            # rejected authorization - the requests that matter most.
+            logger.info('Request refused: method=%r code=%d %s', method_name, e._code, e._message)
             return build_error_response(e, request_id, version)
         except Exception as e:
             logger.error('Unhandled exception in method dispatch', exc_info=True)
-            err = InternalError(str(e))
+            err = InternalError(self._internal_error_message(e))
             return build_error_response(err, request_id, version)
 
-    async def _process_single_async(self, data: dict[str, Any], context: Any = None) -> dict[str, Any] | None:
+    async def _process_single_async(
+        self, data: dict[str, Any], context: Any = None, in_batch: bool = False
+    ) -> dict[str, Any] | None:
         """Process a single request asynchronously and return response as dict."""
         request_id: str | int | None = None
         version = self.version
+        method_name: str | None = None
 
         try:
+            _require_request_object(data)
+            if in_batch:
+                _require_v2_batch_entry(data)
+
             parsed = parse_request(
                 data,
                 allow_dict_params=self.allow_dict_params,
@@ -553,6 +769,7 @@ class JSONRPC:
             request = cast(Request, parsed)
             request_id = request.id
             version = request.version
+            method_name = request.method
 
             if request.is_notification:
                 try:
@@ -564,7 +781,7 @@ class JSONRPC:
                         context=context,
                     )
                 except Exception:
-                    logger.debug('Notification error suppressed (per JSON-RPC spec)', exc_info=True)
+                    logger.warning('Notification failed, error suppressed per JSON-RPC spec', exc_info=True)
                 return None
 
             result = await self._root_group.dispatch_async(
@@ -576,13 +793,22 @@ class JSONRPC:
             )
 
             serialized = self.serialize_result(result)
-            return build_response(serialized, request_id, version)  # type: ignore[arg-type]
+            return build_response(serialized, request_id, version)
 
         except JSONRPCError as e:
+            if request_id is None:
+                # The request never parsed, so request.id was never read. The id
+                # may still be right there in the payload - echo it, or the
+                # caller cannot match this answer to the call it made.
+                request_id = recover_request_id(data)
+            # The refusal arm used to write nothing at any level, which left an
+            # operator no way to see method enumeration, params probing or a
+            # rejected authorization - the requests that matter most.
+            logger.info('Request refused: method=%r code=%d %s', method_name, e._code, e._message)
             return build_error_response(e, request_id, version)
         except Exception as e:
             logger.error('Unhandled exception in async method dispatch', exc_info=True)
-            err = InternalError(str(e))
+            err = InternalError(self._internal_error_message(e))
             return build_error_response(err, request_id, version)
 
     def _handle_single(self, data: dict[str, Any], context: Any = None) -> str | None:
@@ -595,7 +821,7 @@ class JSONRPC:
         except (TypeError, ValueError) as e:
             logger.error('Serialization error in response', exc_info=True)
             request_id = response.get('id')
-            err = InternalError(str(e))
+            err = InternalError(self._internal_error_message(e))
             error_response = build_error_response(err, request_id, self.version)
             return self.serialize(error_response)
 
@@ -609,7 +835,7 @@ class JSONRPC:
         except (TypeError, ValueError) as e:
             logger.error('Serialization error in response', exc_info=True)
             request_id = response.get('id')
-            err = InternalError(str(e))
+            err = InternalError(self._internal_error_message(e))
             error_response = build_error_response(err, request_id, self.version)
             return self.serialize(error_response)
 
@@ -627,20 +853,14 @@ class JSONRPC:
 
         responses = []
         for item in data:
-            result = self._process_single(item, context=context)
+            result = self._process_single(item, context=context, in_batch=True)
             if result is not None:
                 responses.append(result)
 
         if not responses:
             return None
 
-        try:
-            return self.serialize(responses)
-        except (TypeError, ValueError) as e:
-            logger.error('Serialization error in batch response', exc_info=True)
-            err = InternalError(str(e))
-            error_response = build_error_response(err, None, self.version)
-            return self.serialize(error_response)
+        return self._serialize_batch(responses)
 
     async def _handle_batch_async(self, data: list[Any], context: Any = None) -> str | None:
         """Handle batch request asynchronously (concurrent execution)."""
@@ -656,13 +876,15 @@ class JSONRPC:
 
         limit = self._effective_max_concurrent
         if limit == -1:
-            results = await asyncio.gather(*[self._process_single_async(item, context=context) for item in data])
+            results = await asyncio.gather(
+                *[self._process_single_async(item, context=context, in_batch=True) for item in data]
+            )
         else:
             sem = asyncio.Semaphore(limit)
 
             async def _limited(item: Any) -> Any:
                 async with sem:
-                    return await self._process_single_async(item, context=context)
+                    return await self._process_single_async(item, context=context, in_batch=True)
 
             results = await asyncio.gather(*[_limited(item) for item in data])
         responses = [r for r in results if r is not None]
@@ -670,13 +892,42 @@ class JSONRPC:
         if not responses:
             return None
 
+        return self._serialize_batch(responses)
+
+    def _serialize_batch(self, responses: list[dict[str, Any]]) -> str:
+        """Serialize a batch response, isolating an unserializable entry.
+
+        The fast path is a single serialize() call. If that fails, the batch is
+        rebuilt entry by entry so one bad result cannot discard the receipts of
+        its siblings: their methods have already run and committed, and a client
+        that receives no receipt has no reasonable move except to retry the whole
+        batch, re-executing everything.
+        """
         try:
             return self.serialize(responses)
+        except (TypeError, ValueError):
+            logger.error('Serialization error in batch response, isolating the failing entries', exc_info=True)
+
+        repaired: list[dict[str, Any]] = []
+        for response in responses:
+            try:
+                self.serialize(response)
+            except (TypeError, ValueError) as e:
+                logger.error('Serialization error in batch entry id=%r', response.get('id'), exc_info=True)
+                version: Version = '2.0' if 'jsonrpc' in response else '1.0'
+                err = InternalError(self._internal_error_message(e))
+                repaired.append(build_error_response(err, response.get('id'), version))
+            else:
+                repaired.append(response)
+
+        try:
+            return self.serialize(repaired)
         except (TypeError, ValueError) as e:
-            logger.error('Serialization error in batch response', exc_info=True)
-            err = InternalError(str(e))
-            error_response = build_error_response(err, None, self.version)
-            return self.serialize(error_response)
+            # Cannot happen with the default serialize(); an override that fails
+            # on a plain error envelope leaves nothing to preserve.
+            logger.error('Serialization error in repaired batch response', exc_info=True)
+            err = InternalError(self._internal_error_message(e))
+            return self.serialize(build_error_response(err, None, self.version))
 
     def call_method(
         self,

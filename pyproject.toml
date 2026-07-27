@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "python-jsonrpc-lib"
-version = "0.3.2"
+version = "0.4.0"
 description = "Simple, yet solid - Type-safe JSON-RPC 1.0/2.0 with OpenAPI support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -45,6 +45,27 @@ Issues = "https://github.com/uandysmith/python-jsonrpc-lib/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/jsonrpc"]
+
+# An allowlist, not an exclude list. Without it hatchling ships everything the
+# working tree holds that .gitignore does not name, which made the contents of a
+# release depend on a file written for a different purpose entirely: tmp/ holds
+# a security review with runnable proofs of concept, and the only thing keeping
+# it off PyPI was a line in .gitignore. Adding a directory here is deliberate;
+# forgetting to is harmless.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/mkdocs.yml",
+]
+# hatchling also puts .gitignore in every sdist and will not be talked out of it
+# - `exclude` does not override that. Harmless: 84 bytes, and with the allowlist
+# above it no longer decides anything.
 
 [tool.mypy]
 python_version = "3.11"

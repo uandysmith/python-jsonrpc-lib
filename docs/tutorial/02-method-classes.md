@@ -152,12 +152,97 @@ result = self.rpc.call_method('calculate', {
 | **Method groups** | Root only | Hierarchical |
 | **JSON-RPC version** | v2.0 only | Both v1.0 & v2.0 |
 
+## Sharing Code Between Methods
+
+Methods are ordinary classes, so ordinary inheritance works. A base class that
+does **not** define `execute()` is an intermediate base: it carries shared domain
+logic and cannot be registered itself.
+
+```python title="domain_base.py"
+@dataclass
+class AppContext:
+    """What the transport established about the caller."""
+
+    user_id: int
+
+@dataclass
+class RefundParams:
+    """Which charge to refund."""
+
+    charge_id: str
+
+@dataclass
+class RefundResult:
+    """The refund that was started."""
+
+    refund_id: str
+    status: str
+
+class BillingMethod(Method):
+    """Shared helpers for every billing method. No execute() - not mountable."""
+
+    def load_account(self, context: AppContext):
+        return accounts.get(context.user_id)
+
+    def assert_not_frozen(self, account):
+        if account.frozen:
+            raise InvalidParamsError('Account is frozen')
+
+class Refund(BillingMethod):
+    def execute(self, params: RefundParams, context: AppContext) -> RefundResult:
+        account = self.load_account(context)
+        self.assert_not_frozen(account)
+        return refund(account, params.amount)
+```
+
+Type extraction runs for the class that defines `execute()`. `Refund` gets
+`params_type` and `result_type` from its own signature; `BillingMethod` has no
+signature to extract and is skipped.
+
+The template-method shape works too — a base defines `execute()` and the params
+contract, subclasses override only the hooks and share the extracted types:
+
+```python title="template_method.py"
+@dataclass
+class PageParams:
+    """Offset pagination."""
+
+    offset: int = 0
+    limit: int = 50
+
+@dataclass
+class Row:
+    """One row of a listing."""
+
+    id: int
+    label: str
+
+class ListMethod(Method):
+    def execute(self, params: PageParams) -> list[Row]:
+        rows = self.query(params.offset, params.limit)
+        return [self.to_row(r) for r in rows]
+
+    def query(self, offset, limit):
+        raise NotImplementedError
+
+    def to_row(self, record):
+        return Row(id=record.id, label=str(record))
+
+class ListOrders(ListMethod):
+    def query(self, offset, limit):
+        return orders.page(offset, limit)
+```
+
+Registering a class that never implemented `execute()` raises `TypeError` — an
+abstract base is for inheriting, not for mounting.
+
 ## Key Points
 
 - **Decorator**: Fast prototyping, simple APIs
 - **Method Class**: Production, internal calls, context, groups
 - **Internal calls**: Use `self.rpc.call_method()` for method composition
 - **Dataclasses**: Define parameter structure explicitly
+- **Inheritance**: a base without `execute()` is an abstract domain base; type extraction runs for the class that defines `execute()`
 
 !!! warning "Decorator Limitation"
     `@rpc.method` only works with JSON-RPC 2.0. Use Method classes for v1.0.

@@ -6,8 +6,14 @@ One practical detail: FastAPI already serves its own `/docs` for REST routes. Fo
 
 ## Complete FastAPI Application
 
+!!! warning "The identity in this example is whatever the caller typed"
+    `X-User-ID` arrives as a plain request header with nothing verifying it, to
+    keep the example about integration. A real endpoint must derive `user_id`
+    from a verified credential — see
+    [Middleware → Transport layer](../advanced/middleware.md#authentication-middleware).
+
 ```python title="fastapi_app.py"
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, Response
 from fastapi.responses import HTMLResponse
 from dataclasses import dataclass
 from jsonrpc import JSONRPC, Method, MethodGroup
@@ -50,13 +56,18 @@ class Search(Method):
         ]
         return results[:params.limit]
 
+# `def`, not `async def` - safe only because this does no waiting. See below.
 class WhoAmI(Method):
     def execute(self, params: None, context: RequestContext) -> WhoAmIResult:
         """Get current user information."""
-        from jsonrpc.errors import InvalidParamsError
+        from jsonrpc.errors import JSONRPCError
+
+        class Unauthenticated(JSONRPCError):
+            code = -32010
+            message = 'Authentication required'
 
         if not context.user_id:
-            raise InvalidParamsError("Not authenticated")
+            raise Unauthenticated()
 
         return WhoAmIResult(user_id=context.user_id, username=context.username)
 
@@ -74,18 +85,9 @@ generator = OpenAPIGenerator(
     title="FastAPI JSON-RPC API",
     version="2.0.0",
     description="Async JSON-RPC server with FastAPI",
-    servers=[{"url": "http://localhost:8000/rpc"}],
-    headers={
-        "X-User-ID": {
-            "description": "User ID",
-            "schema": {"type": "integer"}
-        },
-        "X-Username": {
-            "description": "Username",
-            "schema": {"type": "string"}
-        }
-    }
 )
+generator.add_header("X-User-ID", "User ID", schema={"type": "integer"})
+generator.add_header("X-Username", "Username", schema={"type": "string"})
 openapi_spec = generator.generate()
 
 # Routes
@@ -101,7 +103,13 @@ async def handle_rpc(
     # Handle async
     body = await request.body()
     response = await rpc.handle_async(body, context=ctx)
-    return response
+
+    # A notification has no response. And return a Response explicitly: handing
+    # FastAPI a str makes it JSON-encode the string, so the client would receive
+    # the whole JSON-RPC envelope wrapped in quotes and escaped.
+    if response is None:
+        return Response(status_code=204)
+    return Response(content=response, media_type='application/json')
 
 @app.get('/openapi.json')
 async def get_openapi():
@@ -138,6 +146,21 @@ if __name__ == '__main__':
     import uvicorn
     uvicorn.run(app, host='0.0.0.0', port=8000)
 ```
+
+!!! danger "A synchronous `execute()` blocks the whole worker"
+    `handle_async()` runs a `def execute()` inline, on the event loop - nothing
+    moves it to a thread. `WhoAmI` above is synchronous, which is fine because it
+    only reads an attribute. Anything that waits is not: a blocking database
+    driver, `requests`, a file read, `time.sleep`. For as long as it runs, this
+    ASGI worker serves nobody - not other requests, not health checks.
+
+    Either make it `async def`, or hand the blocking part to a thread yourself:
+
+    ```python
+    class Report(Method):
+        async def execute(self, params: ReportParams) -> ReportResult:
+            return await asyncio.to_thread(self._blocking_query, params)
+    ```
 
 ## Run the Application
 
@@ -266,7 +289,10 @@ async def handle_rpc(
     # Inject database into context
     ctx = RequestContext(db=db, user_id=request.headers.get('X-User-ID'))
     body = await request.body()
-    return await rpc.handle_async(body, context=ctx)
+    response = await rpc.handle_async(body, context=ctx)
+    if response is None:
+        return Response(status_code=204)
+    return Response(content=response, media_type='application/json')
 ```
 
 ## WebSocket Support
@@ -287,8 +313,9 @@ async def websocket_rpc(websocket: WebSocket):
             ctx = RequestContext(user_id=None, username=None)
             response = await rpc.handle_async(data, context=ctx)
 
-            # Send response
-            await websocket.send_text(response)
+            # Notifications produce no response - there is nothing to send
+            if response is not None:
+                await websocket.send_text(response)
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
@@ -324,12 +351,14 @@ from time import time
 
 app = FastAPI()
 
-# CORS
+# CORS - list the origins you actually serve; "*" lets any page on the
+# internet call this endpoint, which matters a great deal if identity comes
+# from a request header rather than a cookie.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://app.example.com"],
     allow_methods=["POST"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # Logging middleware
@@ -383,13 +412,28 @@ async def handle_rpc(
 ):
     ctx = RequestContext(background_tasks=background_tasks)
     body = await request.body()
-    return await rpc.handle_async(body, context=ctx)
+    response = await rpc.handle_async(body, context=ctx)
+    if response is None:
+        return Response(status_code=204)
+    return Response(content=response, media_type='application/json')
 ```
 
 ## API Versioning
 
 ```python title="versioning.py"
 from fastapi import APIRouter
+
+class SearchV1(Method):
+    """Search, first generation."""
+
+    def execute(self, params: SearchParams) -> list[SearchItem]:
+        return []
+
+class SearchV2(Method):
+    """Search, with the ranking rewrite."""
+
+    def execute(self, params: SearchParams) -> list[SearchItem]:
+        return []
 
 # v1 router
 router_v1 = APIRouter(prefix='/api/v1')
@@ -442,7 +486,9 @@ gunicorn fastapi_app:app \
 
 - Use `async def execute()` for async methods
 - Call `rpc.handle_async()` for async processing
-- Extract context from FastAPI Headers
+- Extract context from FastAPI Headers — and verify a credential before you trust it
+- Return an explicit `Response`, not a `str`: FastAPI would JSON-encode the string and double-wrap the envelope
+- Check `handle_async()` for `None`: a notification has no response (204)
 - Support WebSocket for real-time RPC
 - Use Background Tasks for async operations
 - Deploy with Uvicorn + Gunicorn for production

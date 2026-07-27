@@ -1,7 +1,8 @@
 """Response building and parsing for JSON-RPC protocol."""
 
 import json
-from dataclasses import asdict, is_dataclass
+import weakref
+from dataclasses import fields, is_dataclass
 from typing import Any
 
 from .errors import (
@@ -9,12 +10,37 @@ from .errors import (
     JSONRPCError,
     ParseError,
     RPCError,
+    clip,
 )
 from .types import ErrorResponse, Response, Version
+
+# Leaf types that need no conversion and no copy. Checked by exact type, which
+# is a single hash lookup - the overwhelming majority of values in a result are
+# these, and every other branch below costs more to evaluate.
+_ATOMIC_TYPES = frozenset({str, int, float, bool, type(None)})
+
+# Field names per dataclass, so a result of N rows does not rebuild the same
+# tuple N times. Weak keys: a type generated at runtime stays collectable.
+_field_names_cache: 'weakref.WeakKeyDictionary[type, tuple[str, ...]]' = weakref.WeakKeyDictionary()
+
+
+def _dataclass_field_names(cls: type) -> tuple[str, ...]:
+    names = _field_names_cache.get(cls)
+    if names is None:
+        names = tuple(f.name for f in fields(cls))
+        _field_names_cache[cls] = names
+    return names
 
 
 def _dataclass_to_dict(value: Any) -> Any:
     """Convert dataclass instances to dicts recursively for JSON serialization.
+
+    This walks the structure itself rather than calling dataclasses.asdict().
+    asdict() deep-copies anything that is not a known-atomic leaf, and the copy
+    is pure waste here: the result goes straight into json.dumps() and is then
+    discarded. On a result of a few thousand rows that dominated the response.
+
+    Tuples become lists, matching asdict() and what JSON can express.
 
     Args:
         value: Any value (dataclass, list, dict, or primitive)
@@ -22,10 +48,13 @@ def _dataclass_to_dict(value: Any) -> Any:
     Returns:
         Value with all dataclasses converted to dicts
     """
-    if is_dataclass(value) and not isinstance(value, type):
-        return asdict(value)
+    if type(value) in _ATOMIC_TYPES:
+        return value
 
-    if isinstance(value, list):
+    if is_dataclass(value) and not isinstance(value, type):
+        return {name: _dataclass_to_dict(getattr(value, name)) for name in _dataclass_field_names(type(value))}
+
+    if isinstance(value, (list, tuple)):
         return [_dataclass_to_dict(item) for item in value]
 
     if isinstance(value, dict):
@@ -36,7 +65,7 @@ def _dataclass_to_dict(value: Any) -> Any:
 
 def build_response(
     result: Any,
-    id: str | int,
+    id: str | int | None,
     version: Version = '2.0',
 ) -> dict[str, Any]:
     """Build a JSON-RPC success response dict.
@@ -124,7 +153,7 @@ def parse_response(
 
     if 'jsonrpc' in parsed:
         if parsed['jsonrpc'] != '2.0':
-            raise InvalidRequestError(f'Invalid jsonrpc version: {parsed["jsonrpc"]!r}')
+            raise InvalidRequestError(f'Invalid jsonrpc version: {clip(repr(parsed["jsonrpc"]))}')
         version: Version = '2.0'
     else:
         version = '1.0'
@@ -159,7 +188,10 @@ def parse_response(
     if 'result' not in parsed:
         raise InvalidRequestError("Response must have 'result' or 'error' field")
 
-    if response_id is None:
+    # Absent id and null id are different things: the server answers a request
+    # carrying an explicit "id": null with a null id, and rejecting that here
+    # would mean the client half cannot read the server half's own output.
+    if 'id' not in parsed:
         raise InvalidRequestError("Success response must have 'id' field")
 
     return Response(

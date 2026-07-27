@@ -3,7 +3,7 @@
 import json
 from typing import Any
 
-from .errors import InvalidParamsError, InvalidRequestError, ParseError
+from .errors import InvalidParamsError, InvalidRequestError, ParseError, clip
 from .types import Request, Version
 
 
@@ -45,6 +45,29 @@ def parse_request(
         raise InvalidRequestError(f'Request must be object or array, got {type(parsed).__name__}')
 
 
+def recover_request_id(data: Any) -> str | int | None:
+    """Read the id of a request that failed to parse, for the error response.
+
+    The spec requires the error response to echo the request's id, and allows
+    null only "if there was an error in detecting the id". A malformed `method`
+    or `params` is not that error - the id sits right there and reads fine, so a
+    client tracking calls by id can still match the answer to the call. Without
+    this, every such failure answered with null and the caller waited for a
+    response that had already arrived.
+
+    Returns None when the id genuinely cannot be determined: no id member, or an
+    id that is not a string or a number, which is the case the spec's exception
+    is written for.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    request_id = data.get('id')
+    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+        return None
+    return request_id
+
+
 def _parse_single_request(
     data: dict[str, Any],
     allow_dict_params: bool = True,
@@ -56,7 +79,7 @@ def _parse_single_request(
 
     if 'jsonrpc' in data:
         if data['jsonrpc'] != '2.0':
-            raise InvalidRequestError(f"Invalid jsonrpc version: {data['jsonrpc']!r}, expected '2.0'")
+            raise InvalidRequestError(f"Invalid jsonrpc version: {clip(repr(data['jsonrpc']))}, expected '2.0'")
         version: Version = '2.0'
     else:
         version = '1.0'
@@ -72,11 +95,15 @@ def _parse_single_request(
     if params is not None:
         if isinstance(params, dict):
             if not allow_dict_params:
-                raise InvalidParamsError('Object params not allowed. Use array params: ["value1", "value2"]')
+                raise InvalidParamsError(
+                    'Object params not allowed. Use array params: ["value1", "value2"]',
+                    data={'reason': 'params_shape_not_allowed', 'expected': 'array', 'received': 'object'},
+                )
         elif isinstance(params, list):
             if not allow_list_params:
                 raise InvalidParamsError(
-                    'Array params not allowed. Use object params: {"param1": "value1", "param2": "value2"}'
+                    'Array params not allowed. Use object params: {"param1": "value1", "param2": "value2"}',
+                    data={'reason': 'params_shape_not_allowed', 'expected': 'object', 'received': 'array'},
                 )
         else:
             raise InvalidRequestError(f"Field 'params' must be array or object, got {type(params).__name__}")

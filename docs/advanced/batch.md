@@ -108,6 +108,17 @@ Each request in a batch is independent. One failure doesn't cancel the others �
 ]
 ```
 
+Isolation extends to serialization. If one method returns a value the serializer
+cannot encode, only that entry becomes a `-32603` — carrying its own `id` — and
+every sibling keeps its result. This matters because the methods in a batch have
+already run by then: a response that dropped the siblings' receipts would leave
+the client with retrying as its only move, re-executing everything that already
+committed.
+
+!!! note "A batch of only notifications returns `None`"
+    Notifications produce no response entries, so a batch containing nothing else
+    produces no response at all. Check the return value, as always.
+
 ## Async Batch (Concurrent Execution)
 
 With `handle_async()`, all async methods in the batch run concurrently via `asyncio.gather`. Three database calls that each take 100ms finish in ~100ms total rather than 300ms.
@@ -149,6 +160,11 @@ response = await rpc.handle_async(batch)
 Batch is on by default for v2.0 and off for v1.0. Both can be overridden:
 
 ```python title="batch_config.py"
+batch_request = '''[
+  {"jsonrpc": "2.0", "method": "add", "params": {"a": 1, "b": 2}, "id": 1},
+  {"jsonrpc": "2.0", "method": "add", "params": {"a": 3, "b": 4}, "id": 2}
+]'''
+
 # v2.0 — batch enabled by default
 rpc_v2 = JSONRPC(version='2.0')
 rpc_v2.handle(batch_request)  # Works
@@ -181,15 +197,41 @@ rpc_v2_no_batch.handle(batch_request)  # Returns error -32600
 
 ## Batch Size and Concurrency Limits
 
-Two parameters protect against runaway batch requests:
-
 ```python title="batch_limits.py"
 rpc = JSONRPC(
     version='2.0',
-    max_batch=50,         # Reject batches larger than 50 items (default: 100, -1 = unlimited)
-    max_concurrent=8,     # Max concurrent coroutines in async batch (default: os.cpu_count(), -1 = unlimited)
+    max_batch=50,             # Reject batches of more than 50 items (default: 100, -1 = unlimited)
+    max_request_size=262144,  # Reject bodies over 256 KiB (default: 1 MiB, -1 = unlimited)
+    max_batch_size=131072,    # ...and batch bodies over 128 KiB (default: -1, i.e. only the above)
+    max_concurrent=8,         # Max concurrent coroutines in async batch (default: 64, -1 = unlimited)
 )
 ```
+
+**`max_batch` counts requests. It says nothing about how large they are** — and
+neither did anything else before 0.4.0, so a hundred-item batch of 12.9 MB was
+accepted by the defaults, and a *single* request is not a batch at all, so
+`max_batch` never applied to it: 16.9 MB of integers cost 6.9 seconds of solid
+CPU and 90 MB of heap. Under `handle_async()` that is the whole event loop, since
+nothing on the validation path awaits.
+
+**`max_request_size`** is the barrier for that, and it is checked on the raw body
+before anything parses it — the parse is where the cost starts, so a body this
+server will not serve never becomes objects. The response is `-32600` with
+`id: null`, the one case the spec sanctions a null id, since nothing has read the
+request yet.
+
+**`max_batch_size`** applies the same check only when the body is a batch. It
+exists for the host that raises `max_request_size` because one method
+legitimately receives a large document, and does not want that headroom
+multiplied by `max_batch`.
+
+!!! note "This is a floor, not a substitute for the transport"
+    Your web server should reject an oversized body before your process reads
+    it: `client_max_body_size` in nginx, `MAX_CONTENT_LENGTH` in Flask,
+    `client_max_size` in aiohttp. The limit here exists because this is the layer
+    that knows the params are a list of two million things, and because
+    `rpc.handle()` is also called from queue consumers and socket servers that
+    have no such setting.
 
 **`max_batch`** caps the total number of requests accepted in a single batch call. When exceeded, the entire batch is rejected with `-32600 Invalid Request` before any method executes.
 
@@ -204,7 +246,11 @@ rpc = JSONRPC(
 }
 ```
 
-**`max_concurrent`** throttles how many async method calls run simultaneously inside `handle_async()`. Without a limit, a batch of 100 items would launch 100 coroutines at once — overwhelming connection pools and downstream services. With the default (`os.cpu_count()`), concurrency is proportional to available CPUs:
+**`max_concurrent`** throttles how many async method calls run simultaneously inside `handle_async()`. Without a limit, a batch of 100 items would launch 100 coroutines at once — overwhelming connection pools and downstream services.
+
+The default is **64**: below `max_batch` so the limiter actually does something, and above what typical client pools hold (httpx 10, aiohttp 100, asyncpg 10–20) so one batch does not stall on it. It is deliberately not derived from the CPU count — a coroutine waiting on a socket uses no CPU, so cores say nothing about how many can wait at once.
+
+Set it to match the pool the methods actually use:
 
 ```python title="concurrency_limit.py"
 import asyncio
@@ -255,11 +301,12 @@ for r in results:
 
 - **v2.0 only** by default — explicitly enable for v1.0 if needed
 - **Async batch** runs concurrently via `asyncio.gather` — time scales with the slowest item, not the sum
-- **Each request independent** — errors in one item don't affect others
+- **Each request independent** — errors in one item don't affect others, including serialization errors
 - **Notifications** don't produce response entries
 - **No special endpoint** — same `rpc.handle()` / `rpc.handle_async()` call
-- **`max_batch=100`** — batches larger than this are rejected with `-32600` before execution
-- **`max_concurrent=os.cpu_count()`** — limits simultaneous coroutines in async batch; use `-1` to disable
+- **`max_batch=100`** — batches of more than this many requests are rejected with `-32600` before execution
+- **`max_request_size=1 MiB`** — larger bodies are rejected with `-32600` before they are parsed; `max_batch` bounds the count, this bounds the volume
+- **`max_concurrent=64`** — limits simultaneous coroutines in async batch; use `-1` to disable
 
 ## What's Next?
 

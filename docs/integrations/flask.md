@@ -6,6 +6,12 @@ This page shows a complete application with context, OpenAPI docs, blueprints, a
 
 ## Complete Flask Application
 
+!!! warning "The identity in this example is whatever the caller typed"
+    `X-User-ID` is read straight off the request with nothing verifying it, to
+    keep the integration example about integration. A real endpoint must derive
+    `user_id` from a verified credential — see
+    [Middleware → Transport layer](../advanced/middleware.md#authentication-middleware).
+
 ```python title="flask_app.py"
 from flask import Flask, request
 from dataclasses import dataclass
@@ -46,8 +52,13 @@ class GetProfile(Method):
     def execute(self, params: GetProfileParams, context: RequestContext) -> ProfileResult:
         """Get user profile information."""
         if not context.user_id:
-            from jsonrpc.errors import InvalidParamsError
-            raise InvalidParamsError("Authentication required")
+            from jsonrpc.errors import JSONRPCError
+
+            class Unauthenticated(JSONRPCError):
+                code = -32010
+                message = 'Authentication required'
+
+            raise Unauthenticated()
 
         return ProfileResult(
             user_id=context.user_id,
@@ -72,21 +83,15 @@ generator = OpenAPIGenerator(
     rpc,
     title="Flask JSON-RPC API",
     version="1.0.0",
-    servers=[{"url": "http://localhost:5000/rpc"}],
-    headers={
-        "X-User-ID": {
-            "description": "User ID for authentication",
-            "schema": {"type": "integer"},
-            "required": False
-        }
-    }
 )
+generator.add_header("X-User-ID", "User ID for authentication", schema={"type": "integer"})
 openapi_spec = generator.generate()
 
 # Routes
 @app.route('/rpc', methods=['POST'])
 def handle_rpc():
-    # Extract context from headers
+    # Extract context from headers.
+    # NOTE: a header is not a credential - see the warning below this block.
     user_id = request.headers.get('X-User-ID')
     ctx = RequestContext(
         user_id=int(user_id) if user_id else None,
@@ -95,6 +100,10 @@ def handle_rpc():
 
     # Handle request
     response = rpc.handle(request.data, context=ctx)
+
+    # A notification has no response; returning None here raises inside Flask
+    if response is None:
+        return '', 204
     return response, 200, {'Content-Type': 'application/json'}
 
 @app.route('/openapi.json')
@@ -231,7 +240,10 @@ def handle_rpc():
         user_id=request.headers.get('X-User-ID'),
         ip_address=request.remote_addr
     )
-    return rpc.handle(request.data, context=ctx)
+    response = rpc.handle(request.data, context=ctx)
+    if response is None:
+        return '', 204
+    return response, 200, {'Content-Type': 'application/json'}
 
 # Register blueprint
 app.register_blueprint(rpc_blueprint, url_prefix='/api/v1')
@@ -240,17 +252,35 @@ app.register_blueprint(rpc_blueprint, url_prefix='/api/v1')
 
 ## CORS Support
 
+!!! warning "Do not ship a wildcard origin"
+    `CORS(app)` reflects any origin, including `null`, and grants your custom
+    headers on preflight. Combined with header-asserted identity it lets any page
+    on the internet call your endpoint as any user. Pass an explicit allow-list.
+
+    Note also that a cross-origin `fetch()` with no headers object sends
+    `Content-Type: text/plain` and skips the preflight entirely, so CORS never
+    gets a say. Check the media type in the route if you care about that:
+
+    ```python
+    if not request.mimetype.startswith('application/json'):
+        return {'error': 'Content-Type must be application/json'}, 415
+    ```
+
 ```python title="flask_cors.py"
-from flask_cors import CORS
+from flask import Flask, request
+from flask_cors import CORS, cross_origin
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app, origins=['https://app.example.com'])  # never CORS(app) in production
 
 # Or specific route:
 @app.route('/rpc', methods=['POST'])
-@cross_origin()
+@cross_origin(origins=['https://app.example.com'])
 def handle_rpc():
-    return rpc.handle(request.data)
+    response = rpc.handle(request.data)
+    if response is None:
+        return '', 204
+    return response, 200, {'Content-Type': 'application/json'}
 ```
 
 ## Batch Requests
@@ -285,10 +315,11 @@ curl -X POST http://localhost:5000/rpc \
 
 ## Key Points
 
-- Extract context from HTTP headers/cookies/session
+- Extract context from HTTP headers/cookies/session — and verify a credential before you trust it
+- Check `handle()` for `None` before returning: a notification has no response
 - Return JSON response with `Content-Type: application/json`
 - Use Flask blueprints for API versioning
-- Enable CORS for browser clients
+- Enable CORS for browser clients with an explicit origin allow-list, never a wildcard
 - Batch requests work automatically
 
 ## What's Next?

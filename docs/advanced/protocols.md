@@ -114,6 +114,14 @@ rpc_v2 = JSONRPC(version='2.0')
 # - allow_list_params=True   (arrays allowed)
 ```
 
+!!! note "A 2.0 server also answers 1.0-framed requests"
+    A request with no `jsonrpc` member is treated as 1.0 and answered in 1.0
+    framing, whatever the server is configured as. The strictness flags come from
+    the **server's** configured version, not the request's, so a 1.0-framed
+    request to a 2.0 server enjoys 2.0 permissiveness — it may carry object
+    params, for instance. This is intentional; set the flags explicitly if you
+    need one specific behaviour regardless of framing.
+
 ## Permissive Mode
 
 Sometimes you need to accept non-standard requests — for example, a v1.0 client that sends dict params or needs batch support. Override individual constraints without switching versions.
@@ -182,7 +190,21 @@ A notification is a request without an `id` field. The server executes the metho
 }
 ```
 
-No response is sent.
+No response is sent — `handle()` returns `None`, and it is the transport's job to
+decide what that means. **Check for it.** An unknown or even empty method name
+still takes the notification branch, so `{"jsonrpc":"2.0","method":""}` is enough
+to reach it from an unauthenticated caller, and dereferencing the result takes a
+socket server down as a whole process:
+
+```python
+response = rpc.handle(body)
+if response is not None:
+    transport.send(response)
+```
+
+Errors raised inside a notification are suppressed on the wire, as the spec
+requires, and logged at `WARNING` — that log record is the only evidence the call
+failed, so make sure your configuration surfaces the `jsonrpc-lib` logger.
 
 !!! note "`id: null` is NOT a notification"
     A request with `"id": null` gets a response. Only a **missing** `id` field is a notification.
@@ -258,6 +280,7 @@ class Subscribe(Method):
 - **Strict by default** — spec compliance catches mismatches early, ensures interoperability with any standard client
 - **Permissive opt-in** — relax individual constraints for legacy compatibility, but knowingly
 - **Notifications** — v2.0 only; `id: null` is not a notification, it gets a response
+- **`handle()` returns `str | None`** — always check before sending the result anywhere
 
 ## What's Next?
 

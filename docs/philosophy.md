@@ -8,7 +8,11 @@ python-jsonrpc-lib is built around one idea: the protocol is small, the code sho
 
 ### 1. Type Safety
 
-Parameters are declared as dataclasses. Every incoming request is validated against those types before your code runs — and the result type is validated before the response goes out.
+Parameters are declared as dataclasses. Every incoming request is validated against those types before your code runs.
+
+Return types are checked too, but on different terms: it is opt-in (`validate_results=True`) and it runs **after** `execute()` returns. It is there to catch an implementation drifting from its declared type, and it reports that violation rather than preventing it — a method that changed state has already changed it by the time the check fires.
+
+That asymmetry is deliberate, and it is why the two have different defaults. Params validation defends the server from the caller, so it is always on and there is no flag to turn it off. Result validation defends you from yourself, so it is off by default and belongs in development and in your test suite, where a failure costs nothing and the annotation it checks is the same one your OpenAPI spec publishes. In production it costs about twice the response and tells you only what a test could have told you earlier.
 
 ```python title="type_safety.py"
 from dataclasses import dataclass
@@ -37,29 +41,34 @@ One dataclass definition covers validation, IDE autocomplete, mypy support, and 
 
 ### 2. Transport-Agnostic
 
-`rpc.handle()` takes a JSON string, returns a JSON string. It knows nothing about HTTP, sockets, or frameworks. The transport is entirely your concern.
+`rpc.handle()` takes a JSON string, returns a JSON string — or `None`, for a notification the spec says must not be answered. It knows nothing about HTTP, sockets, or frameworks. The transport is entirely your concern, including deciding what "no response" looks like on it.
 
 ```python title="transport_agnostic.py"
+from fastapi import Response
 from jsonrpc import JSONRPC
 
 rpc = JSONRPC(version='2.0')
 # ... register methods ...
 
 # Flask
-@app.route('/rpc', methods=['POST'])
-def flask_rpc():
-    return rpc.handle(request.data)
+def flask_rpc(request):
+    response = rpc.handle(request.data)
+    if response is None:                       # a notification has no answer
+        return '', 204
+    return response, 200, {'Content-Type': 'application/json'}
 
 # FastAPI
-@app.post('/rpc')
-async def fastapi_rpc(request: Request):
-    body = await request.body()
-    return await rpc.handle_async(body)
+async def fastapi_rpc(request):
+    response = await rpc.handle_async(await request.body())
+    if response is None:
+        return Response(status_code=204)
+    return Response(content=response, media_type='application/json')
 
 # TCP socket
-data = socket.recv(4096)
-response = rpc.handle(data.decode())
-socket.send(response.encode())
+def socket_rpc(connection):
+    response = rpc.handle(connection.recv(4096).decode())
+    if response is not None:
+        connection.send(response.encode())
 ```
 
 Same `rpc` object works everywhere. Tests don't need HTTP mocking — just call `rpc.handle()` directly.
@@ -276,10 +285,10 @@ class CalculatePrice(Method):
         return params.quantity * params.unit_price
 
 class LoggingGroup(MethodGroup):
-    def execute_method(self, method, params, context=None):
+    def around_call(self, call, context, call_next):
         start = time.time()
-        result = super().execute_method(method, params, context)
-        print(f'{method.__class__.__name__} took {time.time() - start:.4f}s')
+        result = call_next(context)
+        print(f'{call.path} took {time.time() - start:.4f}s')
         return result
 
 group = LoggingGroup()

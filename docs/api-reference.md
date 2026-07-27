@@ -25,20 +25,26 @@ JSONRPC(
     allow_dict_params: bool | None = None,
     allow_list_params: bool | None = None,
     max_batch: int = 100,
+    max_request_size: int = 1024 * 1024,
+    max_batch_size: int = -1,
     max_concurrent: int | None = None,
+    expose_internal_errors: bool = False,
 )
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `version` | `'1.0'` \| `'2.0'` | `'2.0'` | JSON-RPC protocol version |
-| `validate_results` | `bool` | `False` | Validate return types against annotations |
+| `validate_results` | `bool` | `False` | Check return values against annotations, result dataclass fields included. On in development, off in production — [see below](#checking-return-values-validate_results) |
 | `context_type` | `type \| None` | `None` | Expected context type for validation |
 | `allow_batch` | `bool \| None` | `None` | Batch requests (default: spec-compliant) |
 | `allow_dict_params` | `bool \| None` | `None` | Object params (default: spec-compliant) |
 | `allow_list_params` | `bool \| None` | `None` | Array params (default: spec-compliant) |
 | `max_batch` | `int` | `100` | Max requests per batch (`-1` = unlimited) |
-| `max_concurrent` | `int \| None` | `None` | Max concurrent coroutines in async batch (`None` = `os.cpu_count()`, `-1` = unlimited) |
+| `max_request_size` | `int` | `1048576` | Largest body accepted, refused before it is parsed (`-1` = unlimited) |
+| `max_batch_size` | `int` | `-1` | Same, applied only when the body is a batch (`-1` = only `max_request_size` applies) |
+| `max_concurrent` | `int \| None` | `None` | Max concurrent coroutines in async batch (`None` = `64`, `-1` = unlimited) |
+| `expose_internal_errors` | `bool` | `False` | Send the caught exception's text in the `-32603` message. Off by default: the caller gets a bare `Internal error` and the full exception goes to the log |
 
 **Default params mode (spec-compliant):**
 
@@ -50,7 +56,8 @@ JSONRPC(
 **Methods:**
 
 ```python
-# Handle JSON-RPC request (sync)
+# Handle JSON-RPC request (sync). Returns None for a notification.
+# `bytes` must be UTF-8; other encodings are a parse error.
 rpc.handle(raw_data: str | bytes, context: Any = None) -> str | None
 
 # Handle JSON-RPC request (async)
@@ -178,8 +185,37 @@ class MyMethod(Method):
 - Return type annotation is required
 - Optional 3rd parameter `context` with type hint
 
+**Inheritance:**
+
+Type extraction runs for classes that define their own `execute()`. A class that
+does not is an intermediate base — it may carry shared domain logic, and it
+inherits `params_type`, `result_type`, `accepts_context` and `context_type`
+through ordinary attribute lookup. Registering such a base raises `TypeError`;
+only concrete subclasses can be mounted.
+
+```python
+class BillingMethod(Method):
+    """Domain base: helpers shared by every billing method, no execute()."""
+
+    def charge(self, account, amount):
+        ...
+
+class Refund(BillingMethod):
+    def execute(self, params: RefundParams) -> RefundResult:
+        ...
+```
+
+The template-method shape works too: a base defines `execute()` and the params
+contract, subclasses override only hook methods and share the extracted types.
+
 **Available in `execute()`:**
 - `self.rpc` - access to parent JSONRPC instance for internal calls
+
+!!! note "One instance, one mount"
+    A `Method` or `MethodGroup` instance belongs to exactly one place in exactly
+    one tree; registering it twice raises `ValueError`. Instances are shared
+    across every request and every thread, so keep per-request state in
+    `context`, never on `self`.
 
 **Examples:**
 
@@ -225,13 +261,36 @@ group.unregister('subgroup_name')
 **Override for middleware:**
 
 ```python
+# Runs for EVERY group on the resolved path, outermost first.
+# This is the hook for guards, logging, caching, rate limiting.
 class CustomGroup(MethodGroup):
-    def execute_method(self, method, params, context=None):
+    def around_call(self, call: CallInfo, context, call_next):
         # Before execution
-        result = super().execute_method(method, params, context)
+        result = call_next(context)   # not calling it vetoes the call
         # After execution
         return result
+
+    async def around_call_async(self, call: CallInfo, context, call_next):
+        return await call_next(context)
+
+# Runs ONLY on the group that owns the method. Use it to change how that
+# group's own methods are invoked, not as a guard over a namespace.
+class OwningGroup(MethodGroup):
+    def execute_method(self, method, params, context=None):
+        return super().execute_method(method, params, context)
 ```
+
+`CallInfo` carries `path` (the full dotted path as requested), `method` (the
+`Method` instance), `params` (already validated) and `id` (the request id, for
+correlating log lines with the response the caller received — `None` for a
+notification).
+
+A group that overrides only the synchronous hook of either pair refuses to accept
+an async method below it at registration time — a synchronous wrapper cannot
+await the rest of the chain. Mounting a group that overrides `execute_method()`
+but owns only subgroups is also refused: that hook could never run there.
+
+See [Middleware](advanced/middleware.md) for worked examples.
 
 ---
 
@@ -317,6 +376,55 @@ spec = generator.generate()
 
 ---
 
+## Serialization hooks
+
+Two overridable methods sit on the outbound path, and they do different jobs.
+
+**`serialize(data, **kwargs) -> str`** turns the finished response into JSON. It
+is the last step and sees the whole payload, so this is where custom types
+belong:
+
+```python title="custom_types.py"
+import json
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
+from jsonrpc import JSONRPC
+
+def encode(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    raise TypeError(f'{type(value).__name__} is not JSON serializable')
+
+class MyRPC(JSONRPC):
+    def serialize(self, data, **kwargs):
+        kwargs.setdefault('allow_nan', False)   # keep the non-finite float guard
+        return json.dumps(data, default=encode, **kwargs)
+```
+
+This works for those types wherever they appear — nested in a dataclass, inside
+a list, as a dict value.
+
+!!! warning "Keep `allow_nan=False`"
+    Overriding `serialize()` replaces the default that refuses `NaN` and
+    `Infinity`. Without that argument they go back on the wire as bare tokens,
+    which no conforming JSON parser accepts — the response becomes unreadable
+    for the client rather than failing loudly for you.
+
+**`serialize_result(result) -> Any`** is the dataclass-to-dict conversion, one
+step earlier. Override it to make that walk faster; do **not** override it to
+add a type. By the time `super().serialize_result()` returns, the value is a
+plain dict and the custom object nested inside it has already gone past — there
+is no point left to intercept it.
+
+Both hooks cover the outbound direction only. Parameters arriving as JSON have
+no equivalent: convert them in the params dataclass's `__post_init__`. See
+[Parameters → Types JSON cannot express](tutorial/03-parameters.md#types-json-cannot-express).
+
 ## Error Classes
 
 ```python
@@ -358,6 +466,37 @@ class MyMethod(Method):
         return {"ok": True}
 ```
 
+**Structured detail on `-32602`:**
+
+Every parameter rejection fills in the spec's `data` field, so a client does not
+have to parse the message to find out which argument to fix:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "error": {
+    "code": -32602,
+    "message": "Parameter 'age' expected type 'int', got 'str'",
+    "data": {"reason": "type_mismatch", "parameter": "age", "expected": "int", "received": "str"}
+  },
+  "id": 1
+}
+```
+
+`reason` is always present. The values it takes are `type_mismatch`,
+`missing_parameter`, `unknown_parameter`, `too_many_positional`,
+`invalid_params_container`, `no_parameters_accepted`, `no_matching_variant`,
+`rejected_by_validator` (a `ValueError` from your `__post_init__`) and
+`params_shape_not_allowed`. `parameter` names the argument at fault wherever one
+can be identified. The rejected value is never echoed back.
+
+An `InvalidParamsError` you raise yourself carries whatever `data` you pass it,
+or none:
+
+```python
+raise InvalidParamsError("Email is required", data={"reason": "missing_email"})
+```
+
 ---
 
 ## Type System
@@ -367,7 +506,7 @@ class MyMethod(Method):
 | Python Type | JSON type | Notes |
 |-------------|-----------|-------|
 | `int` | number (integer) | No float coercion |
-| `float` | number | Accepts int values too |
+| `float` | number | Accepts int values too. `NaN`/`Infinity` rejected — neither exists in JSON |
 | `str` | string | |
 | `bool` | boolean | Must be exactly `true/false` |
 | `list` | array | Untyped |
@@ -376,10 +515,44 @@ class MyMethod(Method):
 | `dict[K, V]` | object | Keys and values validated |
 | `@dataclass` | object | Recursively validated |
 | `T \| None` | T or null | Optional type |
-| `T \| U` | T or U | Union type (first match wins) |
-| `Literal["a", "b"]` | enum string | Restricted values |
+| `T \| U` | T or U | Union type (first match wins; a value matching no variant is rejected) |
+| `Literal["a", "b"]` | enum string | Restricted values, type-strict (`true` does not satisfy `Literal[1]`) |
 | `Any` | any | No validation |
 | `None` | null or absent | No parameters |
+
+Nesting is bounded at `MAX_NESTING_DEPTH` (64) regardless of how the recursion is
+spelled. Only real dataclass fields are parameters: `ClassVar` entries and the
+`KW_ONLY` sentinel are not settable from the wire.
+
+That table is the whole list. A params field annotated with anything else —
+`tuple`, `set`, `Enum`, `datetime`, `date`, `UUID`, `Decimal`, `bytes` — is
+refused when the method class is defined, nested dataclasses included: JSON
+cannot express those, so no value the caller could send would ever be accepted.
+Take the field as what arrives on the wire and convert it in `__post_init__`,
+where a `raise InvalidParamsError` becomes a `-32602` the caller can read:
+
+```python title="wire_types.py"
+from dataclasses import dataclass
+from datetime import datetime
+from jsonrpc.errors import InvalidParamsError
+
+@dataclass
+class BookingParams:
+    starts_at: str  # ISO-8601, not datetime
+
+    def __post_init__(self):
+        try:
+            self.when = datetime.fromisoformat(self.starts_at)
+        except ValueError:
+            raise InvalidParamsError('starts_at must be an ISO-8601 timestamp') from None
+```
+
+Raise `InvalidParamsError`, not a bare `ValueError`: a `ValueError` is still a
+`-32602`, but with a fixed message, because the ones raised by `fromisoformat`,
+`int`, `Decimal` and `UUID` embed the caller's own string in their text.
+
+Going the other way, a *result* may contain any type your `serialize()` hook
+knows how to encode — see [Serialization hooks](#serialization-hooks) above.
 
 ### Nested Type Example
 
@@ -391,6 +564,51 @@ class Config:
     tags: list[str] | None = None
     max_workers: int = 4
 ```
+
+### Checking return values: `validate_results`
+
+```python title="validate_results.py"
+import os
+from jsonrpc import JSONRPC
+
+# On where a failure is cheap, off where throughput matters.
+rpc = JSONRPC(validate_results=os.getenv('ENV') != 'production')
+```
+
+Off by default. When on, the return value is checked against the method's return
+annotation — the outer type and every field of a result dataclass, including the
+dataclasses inside a `list` or `dict`, because a dataclass enforces nothing at
+runtime and `Row(score='high')` is ordinary Python. A mismatch is `-32001` naming
+the path:
+
+```json
+{"error": {"code": -32001, "message": "Expected return type 'float' at 'rows[1].score', got 'str'"}}
+```
+
+**Turn it on in development and in your test suite.** That is where it earns its
+keep: it catches a method drifting from its declared type on the first call that
+does it, and the annotation is also what the OpenAPI spec publishes — so a
+mismatch means your published contract is already wrong. A test suite that runs
+with it on will not ship that.
+
+**Leave it off in production**, unless the traffic is small enough not to care.
+Validating a 2000-row page costs about **1.9x** the unvalidated response, and the
+cost scales with the size of the result, not the size of the request. Two things
+make that trade easy:
+
+- It is a check on *your own code*, not on the caller. Turning it off gives an
+  attacker nothing — every inbound value is still validated, always, with no flag
+  to disable it.
+- It runs **after** `execute()` returns, so it reports a broken contract rather
+  than preventing one. A method that wrote to the database and then returned the
+  wrong type has already written. In production you find out from `-32001`
+  instead of from a wrong-shaped result; in a test you find out before the deploy.
+
+!!! note "A cyclic result"
+    A result that refers back to itself is refused with
+    `Return value nests deeper than 64 levels` rather than being walked forever.
+    With the check off it reaches the serializer instead, which ends in
+    `-32603` — either way it stops, but the first message is the useful one.
 
 ---
 
@@ -407,6 +625,14 @@ rpc = JSONRPC(version='1.0')
 rpc = JSONRPC(version='2.0')
 # Accepts: {"jsonrpc": "2.0", "method": "add", "params": {"a": 1, "b": 2}, "id": 1}
 ```
+
+!!! note "A 2.0 server also answers 1.0-framed requests"
+    A request with no `jsonrpc` member is treated as 1.0 and answered in 1.0
+    framing, whatever the server is configured as. The strictness flags
+    (`allow_batch`, `allow_dict_params`, `allow_list_params`) come from the
+    **server's** configured version, not the request's — so a 1.0-framed request
+    to a 2.0 server enjoys 2.0 permissiveness. This is intentional; configure the
+    flags explicitly if you need one specific behaviour.
 
 ### Permissive Mode
 
@@ -459,8 +685,13 @@ async def fetch(url: str) -> dict:
 ```python
 from dataclasses import dataclass
 from jsonrpc import JSONRPC, Method, MethodGroup
-from jsonrpc.errors import InvalidParamsError
+from jsonrpc.errors import JSONRPCError
 from jsonrpc.openapi import OpenAPIGenerator
+
+class Unauthenticated(JSONRPCError):
+    code = -32010
+    message = 'Authentication required'
+
 
 # Parameters
 @dataclass
@@ -477,7 +708,7 @@ class Search(Method):
     def execute(self, params: SearchParams, context: AuthContext) -> list[dict]:
         """Search items."""
         if not context.user_id:
-            raise InvalidParamsError("Authentication required")
+            raise Unauthenticated()
         return [{"id": 1, "title": f"Result: {params.query}"}]
 
 # Setup
@@ -503,27 +734,13 @@ response = rpc.handle(
 
 ## Changelog
 
-### 0.3.2
+See [CHANGELOG.md](https://github.com/uandysmith/python-jsonrpc-lib/blob/main/CHANGELOG.md)
+for the full history.
 
-**Bug fixes:**
-
-- `add_security_scheme`: replaced `**kwargs` with `options: dict` parameter, fixing inability to create `apiKey` schemes (conflicting `name` parameter, `in` as Python reserved word)
-- `_convert_value`: Union types containing multiple dataclasses now correctly try all variants instead of crashing on the first mismatch
-- `simplify_id` flag now consistently applies to JSONRPCError schema in OpenAPI output
-- `unregister()` now clears `.rpc` attribute, allowing re-registration of the same Method instance
-- `max_concurrent` parameter is now validated (`-1` or `>= 1`); previously `0` caused a silent deadlock
-- `version` parameter is now validated at init; invalid values like `'3.0'` raise `ValueError`
-- Fixed `bearer_format` typo in tests (should be `bearerFormat` per OpenAPI spec)
-- Fixed OpenAPI tutorial example to match actual generated output
-
-### 0.3.1 (First Public Release)
-
-- JSON-RPC 1.0 and 2.0 support
-- Dataclass-based parameter validation
-- Built-in OpenAPI generation
-- Hierarchical context support
-- Decorator API for prototyping
-- Async/sync methods
-- Batch request handling
-- Strict mode by default
-- Zero external dependencies
+**0.4.0 highlights:** group middleware moved to `around_call()`, which runs for
+every group on the resolved path — `execute_method()` only ever ran on the group
+owning the method, so guards mounted over a namespace were inert. Non-finite
+floats, non-UTF-8 bytes and non-object payloads are rejected; a union matching no
+variant fails closed; exception text no longer reaches callers by default;
+`validate_results=True` works for dataclass results and now checks their fields;
+intermediate `Method` base classes are allowed. Read the upgrade notes before upgrading.

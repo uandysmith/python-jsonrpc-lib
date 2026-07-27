@@ -48,6 +48,8 @@ Pass in a JSON string, get a JSON string back. What carries it over the wire is 
 
 If `a` is `"five"` instead of `5`, the caller receives a `-32602 Invalid params` error immediately — no exception handling on your end.
 
+That covers the types JSON itself has. For a value JSON cannot express — a date, an `Enum`, a `Decimal` — take it as a `str` and convert it in `__post_init__`, raising `ValueError` on anything you will not accept; that also becomes `-32602`. See [Parameters](docs/tutorial/03-parameters.md#types-json-cannot-express).
+
 The same `AddParams` dataclass drives validation, IDE autocomplete, and the OpenAPI schema.
 
 ## Why python-jsonrpc-lib?
@@ -55,7 +57,7 @@ The same `AddParams` dataclass drives validation, IDE autocomplete, and the Open
 - **Zero dependencies** — pure Python 3.11+. Nothing to pin, nothing to audit beyond the library itself.
 - **Type validation from dataclasses** — declare parameters as a dataclass, get automatic validation and clear error messages for free.
 - **OpenAPI docs auto-generated** — type hints and docstrings you already wrote become a full OpenAPI 3.0 spec. Point any Swagger-compatible UI at it and your API is self-documented.
-- **Transport-agnostic** — `rpc.handle(json_string)` returns a string. HTTP, WebSocket, TCP, message queue: your choice.
+- **Transport-agnostic** — `rpc.handle(json_string)` returns a string, or `None` for a notification. HTTP, WebSocket, TCP, message queue: your choice.
 - **Spec-compliant by default** — v1.0 and v2.0 rules enforced out of the box, configurable when you need to support legacy clients.
 
 ## Namespacing and Middleware
@@ -63,6 +65,8 @@ The same `AddParams` dataclass drives validation, IDE autocomplete, and the Open
 Use `MethodGroup` to organize methods into namespaces and add cross-cutting concerns:
 
 ```python
+from jsonrpc.errors import JSONRPCError
+
 math = MethodGroup()
 math.register('add', Add())
 
@@ -70,6 +74,20 @@ rpc = JSONRPC(version='2.0')
 rpc.register('math', math)
 
 # "math.add" is now available
+
+# Cross-cutting concerns go in around_call(), which runs for every group
+# on the path -- so a guard mounted here covers everything nested below it.
+# Refuse with a JSONRPCError subclass: anything else becomes a bare
+# -32603 Internal error, and the caller cannot tell a refusal from a fault.
+class Unauthenticated(JSONRPCError):
+    code = -32010
+    message = 'Authentication required'
+
+class RequireAuth(MethodGroup):
+    def around_call(self, call, context, call_next):
+        if context.user_id is None:
+            raise Unauthenticated()
+        return call_next(context)
 ```
 
 ## Quick Prototyping

@@ -12,7 +12,12 @@
 from dataclasses import dataclass
 import uuid
 from jsonrpc import JSONRPC, Method
-from jsonrpc.errors import InvalidParamsError
+from jsonrpc.errors import JSONRPCError
+
+class Unauthenticated(JSONRPCError):
+    code = -32010
+    message = 'Authentication required'
+
 
 @dataclass
 class RequestContext:
@@ -32,7 +37,7 @@ class ProfileResult:
 class GetProfile(Method):
     def execute(self, params: GetProfileParams, context: RequestContext) -> ProfileResult:
         if not context.user_id:
-            raise InvalidParamsError("Authentication required")
+            raise Unauthenticated()
 
         return ProfileResult(
             user_id=context.user_id,
@@ -67,7 +72,14 @@ response = rpc.handle(request, context=ctx)
 ```python title="rbac.py"
 from dataclasses import dataclass
 from jsonrpc import JSONRPC, MethodGroup, Method
-from jsonrpc.errors import InvalidParamsError
+from jsonrpc.errors import JSONRPCError
+
+class Forbidden(JSONRPCError):
+    """Authenticated, but not allowed. Distinct from Unauthenticated on purpose."""
+
+    code = -32011
+    message = 'Forbidden'
+
 
 @dataclass
 class AuthContext:
@@ -99,7 +111,7 @@ class BanUserResult:
 class DeleteUser(Method):
     def execute(self, params: DeleteUserParams, context: AuthContext) -> DeleteUserResult:
         if not context.is_admin:
-            raise InvalidParamsError("Admin privileges required")
+            raise Forbidden("Admin privileges required")
         return DeleteUserResult(
             deleted_user_id=params.target_user_id,
             deleted_by=context.user_id,
@@ -108,7 +120,7 @@ class DeleteUser(Method):
 class BanUser(Method):
     def execute(self, params: BanUserParams, context: AuthContext) -> BanUserResult:
         if not (context.is_admin or context.is_moderator):
-            raise InvalidParamsError("Moderator or admin privileges required")
+            raise Forbidden("Moderator or admin privileges required")
         return BanUserResult(
             banned_user_id=params.user_id,
             reason=params.reason,
@@ -155,7 +167,7 @@ response = rpc.handle(request, context=ctx)
 {
   "jsonrpc": "2.0",
   "error": {
-    "code": -32602,
+    "code": -32011,
     "message": "Admin privileges required"
   },
   "id": 1
@@ -164,11 +176,30 @@ response = rpc.handle(request, context=ctx)
 
 ## Flask Integration
 
+!!! warning "`X-User-ID` is not authentication"
+    These examples read identity straight off a request header, because the
+    subject here is *context*, not credentials — a header keeps the example to
+    one line. A caller can set any header they like, so an endpoint wired this
+    way grants whatever the caller asserts, and an audit trail built on it names
+    whoever the caller named.
+
+    In real code, derive `user_id` from something you verified: a signed session,
+    a validated JWT claim, a token looked up in your store. See
+    [Middleware → Transport layer](../advanced/middleware.md#authentication-middleware)
+    for what that looks like. The RPC layer cannot check this for you: it never
+    sees your headers, and a guard like `RequireAuthGroup` can only trust the
+    context it is handed.
+
 ```python title="flask_context.py"
 from flask import Flask, request
 from dataclasses import dataclass
 from jsonrpc import JSONRPC, Method
-from jsonrpc.errors import InvalidParamsError
+from jsonrpc.errors import JSONRPCError
+
+class Unauthenticated(JSONRPCError):
+    code = -32010
+    message = 'Authentication required'
+
 
 app = Flask(__name__)
 
@@ -190,7 +221,7 @@ class SecureOperationResult:
 class SecureOperation(Method):
     def execute(self, params: SecureOperationParams, context: FlaskContext) -> SecureOperationResult:
         if not context.user_id:
-            raise InvalidParamsError("Authentication required")
+            raise Unauthenticated()
         return SecureOperationResult(
             action=params.action,
             executed_by=context.user_id,
@@ -228,10 +259,15 @@ curl -X POST http://localhost:5000/rpc \
 ## FastAPI Integration
 
 ```python title="fastapi_context.py"
-from fastapi import FastAPI, Request, Header
+from fastapi import FastAPI, Request, Header, Response
 from dataclasses import dataclass
 from jsonrpc import JSONRPC, Method
-from jsonrpc.errors import InvalidParamsError
+from jsonrpc.errors import JSONRPCError
+
+class Unauthenticated(JSONRPCError):
+    code = -32010
+    message = 'Authentication required'
+
 
 app = FastAPI()
 
@@ -248,7 +284,7 @@ class WhoAmIResult:
 class WhoAmI(Method):
     def execute(self, params: None, context: FastAPIContext) -> WhoAmIResult:
         if not context.user_id:
-            raise InvalidParamsError("Not authenticated")
+            raise Unauthenticated()
         return WhoAmIResult(user_id=context.user_id, username=context.username)
 
 rpc = JSONRPC(version='2.0', context_type=FastAPIContext)
@@ -262,7 +298,10 @@ async def handle_rpc(
 ):
     ctx = FastAPIContext(user_id=x_user_id, username=x_username)
     body = await request.body()
-    return await rpc.handle_async(body, context=ctx)
+    response = await rpc.handle_async(body, context=ctx)
+    if response is None:  # notification: nothing to send back
+        return Response(status_code=204)
+    return Response(content=response, media_type='application/json')
 ```
 
 ## Hierarchical Context

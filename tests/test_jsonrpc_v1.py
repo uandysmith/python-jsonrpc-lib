@@ -77,16 +77,31 @@ class TestJSONRPCV1Protocol(unittest.TestCase):
         self.assertEqual(data['result'], 'pong')
 
     def test_v1_notification_with_null_id(self):
-        """Test v1.0 notification (id=null)."""
+        """A 1.0 notification is a request whose id is null, and gets no response.
+
+        The library used to answer these, while build_notification(version='1.0')
+        in the same package produced exactly this shape - one half of the package
+        built notifications the other half replied to.
+        """
         request = '{"method": "ping", "params": [], "id": null}'
         response = self.rpc.handle(request)
 
-        # v1.0 notification: returns response with id=null
-        # (v2.0 notifications return None)
-        self.assertIsNotNone(response)
+        self.assertIsNone(response)
+
+    def test_v1_request_with_an_id_still_gets_a_response(self):
+        """Only a null id marks a notification; everything else is answered."""
+        response = self.rpc.handle('{"method": "ping", "params": [], "id": 1}')
         data = json.loads(response)
         self.assertEqual(data['result'], 'pong')
-        self.assertIsNone(data['id'])
+        self.assertEqual(data['id'], 1)
+
+    def test_v1_notification_round_trips_with_build_notification(self):
+        """The client half and the server half agree on what a notification is."""
+        from jsonrpc import build_notification
+
+        notification = build_notification('ping', [], version='1.0')
+        self.assertIsNone(notification['id'])
+        self.assertIsNone(self.rpc.handle(json.dumps(notification)))
 
     def test_v1_error_response_format(self):
         """Test v1.0 error response format."""
@@ -565,7 +580,8 @@ class TestJSONRPCV1ErrorHandling(unittest.TestCase):
 
         self.assertIsNotNone(data['error'])
         self.assertEqual(data['error']['code'], -32603)  # Internal error
-        self.assertIn('Unexpected error', data['error']['message'])
+        # Sanitized by default: the exception text is logged, not sent to the caller.
+        self.assertEqual(data['error']['message'], 'Internal error')
 
     def test_handle_async_unexpected_exception(self):
         """Test handle_async() with unexpected exception returns InternalError."""
@@ -606,7 +622,7 @@ class TestJSONRPCV1DefensiveExceptionHandling(unittest.TestCase):
 
             self.assertIsNotNone(data['error'])
             self.assertEqual(data['error']['code'], -32603)  # Internal error
-            self.assertIn('v1 dispatcher error', data['error']['message'])
+            self.assertEqual(data['error']['message'], 'Internal error')
 
 
 class TestJSONRPCV1StrictBatchRejection(unittest.TestCase):

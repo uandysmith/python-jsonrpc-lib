@@ -467,6 +467,12 @@ generator.add_security_requirement("OAuth2", scopes=["read", "write"])
 
 ## Custom Headers
 
+Declaring a header in the spec documents it for readers and tooling. It does not
+make it a credential — see the
+[warning on the context tutorial](05-context.md#flask-integration). If a header
+carries identity, your transport handler has to verify something before trusting
+it.
+
 ```python title="custom_headers.py"
 generator = OpenAPIGenerator(rpc, title="API with Headers", version="1.0.0")
 generator.add_header(

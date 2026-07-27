@@ -2,8 +2,9 @@
 
 import json
 import unittest
+from dataclasses import dataclass
 
-from jsonrpc import JSONRPC, MethodGroup
+from jsonrpc import JSONRPC, Method, MethodGroup
 from jsonrpc.openapi import OpenAPIGenerator
 from tests.fixtures import (
     AddMethod,
@@ -107,6 +108,41 @@ class TestOpenAPIBasic(unittest.TestCase):
         generator = OpenAPIGenerator(self.rpc)
         json_str = generator.generate_json(indent=4)
         self.assertIn('    ', json_str)
+
+    def test_a_narrow_serialize_override_does_not_break_the_spec(self):
+        """The spec is not a response and must not go through serialize().
+
+        The documented way to plug in a faster JSON library is
+        `def serialize(self, data)` - orjson has no `indent` keyword to accept.
+        Handing the spec to that hook made generate_json() raise TypeError from
+        inside the library, on a call the author never wrote.
+        """
+
+        class NarrowRPC(JSONRPC):
+            def serialize(self, data):  # exactly the signature api-reference.md shows
+                return json.dumps(data)
+
+        rpc = NarrowRPC()
+        group = MethodGroup()
+        group.register('add', AddMethod())
+        rpc.register('math', group)
+
+        spec = json.loads(OpenAPIGenerator(rpc).generate_json(indent=4))
+        self.assertEqual(spec['openapi'], '3.0.3')
+
+    def test_a_failing_serialize_override_does_not_reach_the_spec(self):
+        """Proves the spec really bypasses the hook, rather than surviving it."""
+
+        class BrokenRPC(JSONRPC):
+            def serialize(self, data, **kwargs):
+                raise AssertionError('generate_json() must not use the response serializer')
+
+        rpc = BrokenRPC()
+        group = MethodGroup()
+        group.register('add', AddMethod())
+        rpc.register('math', group)
+
+        self.assertEqual(json.loads(OpenAPIGenerator(rpc).generate_json())['openapi'], '3.0.3')
 
 
 class TestOpenAPIBasicMethods(unittest.TestCase):
@@ -1064,12 +1100,162 @@ class TestOpenAPIEdgeCases(unittest.TestCase):
 
     def test_generate_yaml_success_when_pyyaml_installed(self):
         """generate_yaml() returns YAML string when PyYAML is installed (line 495)."""
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest('PyYAML is not installed')
+
         rpc = JSONRPC(version='2.0')
         rpc.register('ping', NoParamsMethod())
         generator = OpenAPIGenerator(rpc)
         yaml_str = generator.generate_yaml()
         self.assertIsInstance(yaml_str, str)
         self.assertEqual(yaml_str[:7], 'openapi')
+
+
+class TestSchemaNamesIdentifyTheType(unittest.TestCase):
+    """Two dataclasses sharing a class name must not share one schema."""
+
+    def _colliding(self):
+        def make(field_name):
+            source = (
+                'from dataclasses import dataclass\n'
+                '@dataclass\n'
+                'class Item:\n'
+                '    """An item."""\n'
+                f'    {field_name}: int\n'
+            )
+            namespace: dict = {}
+            exec(source, namespace)  # noqa: S102
+            return namespace['Item']
+
+        return make('a'), make('b')
+
+    def test_each_gets_its_own_schema(self):
+        ItemA, ItemB = self._colliding()
+
+        @dataclass
+        class WrapA:
+            """First wrapper."""
+
+            item: ItemA
+
+        @dataclass
+        class WrapB:
+            """Second wrapper."""
+
+            item: ItemB
+
+        class MA(Method):
+            """A."""
+
+            def execute(self, params: None) -> WrapA:
+                return WrapA(item=ItemA(a=1))
+
+        class MB(Method):
+            """B."""
+
+            def execute(self, params: None) -> WrapB:
+                return WrapB(item=ItemB(b=1))
+
+        rpc = JSONRPC(version='2.0')
+        rpc.register('a', MA())
+        rpc.register('b', MB())
+        schemas = OpenAPIGenerator(rpc).generate()['components']['schemas']
+
+        ref_a = schemas['WrapA']['properties']['item']['$ref'].rsplit('/', 1)[-1]
+        ref_b = schemas['WrapB']['properties']['item']['$ref'].rsplit('/', 1)[-1]
+
+        self.assertNotEqual(ref_a, ref_b)
+        self.assertEqual(list(schemas[ref_a]['properties']), ['a'])
+        self.assertEqual(list(schemas[ref_b]['properties']), ['b'])
+
+    def test_an_uncontested_name_stays_short(self):
+        @dataclass
+        class Unique:
+            """Unique."""
+
+            v: int
+
+        class M(Method):
+            """M."""
+
+            def execute(self, params: None) -> Unique:
+                return Unique(v=1)
+
+        rpc = JSONRPC(version='2.0')
+        rpc.register('m', M())
+        self.assertIn('Unique', OpenAPIGenerator(rpc).generate()['components']['schemas'])
+
+
+class TestGeneratedDocstringsStayOutOfTheSpec(unittest.TestCase):
+    """@dataclass writes __doc__ when the author did not."""
+
+    def test_a_class_with_no_docstring_at_all_has_no_description(self):
+        from jsonrpc.openapi import _authored_docstring
+
+        class Bare:
+            __doc__ = None
+
+        self.assertIsNone(_authored_docstring(Bare))
+
+    def test_a_dataclass_without_a_docstring_has_no_description(self):
+        @dataclass
+        class Bare:
+            v: int
+
+        class M(Method):
+            """M."""
+
+            def execute(self, params: None) -> Bare:
+                return Bare(v=1)
+
+        rpc = JSONRPC(version='2.0')
+        rpc.register('m', M())
+        schema = OpenAPIGenerator(rpc).generate()['components']['schemas']['Bare']
+
+        self.assertNotIn('description', schema)
+
+    def test_an_authored_docstring_survives(self):
+        @dataclass
+        class Documented:
+            """What this is for."""
+
+            v: int
+
+        class M(Method):
+            """M."""
+
+            def execute(self, params: None) -> Documented:
+                return Documented(v=1)
+
+        rpc = JSONRPC(version='2.0')
+        rpc.register('m', M())
+        schema = OpenAPIGenerator(rpc).generate()['components']['schemas']['Documented']
+
+        self.assertEqual(schema['description'], 'What this is for.')
+
+    def test_a_multi_line_docstring_is_never_mistaken_for_a_generated_one(self):
+        @dataclass
+        class Documented:
+            """Documented(v: int)
+
+            The first line looks generated on purpose.
+            """
+
+            v: int
+
+        class M(Method):
+            """M."""
+
+            def execute(self, params: None) -> Documented:
+                return Documented(v=1)
+
+        rpc = JSONRPC(version='2.0')
+        rpc.register('m', M())
+        schema = OpenAPIGenerator(rpc).generate()['components']['schemas']['Documented']
+
+        self.assertIn('looks generated on purpose', schema['description'])
 
 
 if __name__ == '__main__':

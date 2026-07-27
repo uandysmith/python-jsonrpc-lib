@@ -1,6 +1,17 @@
 # Custom Transports
 
-`python-jsonrpc-lib` is transport-agnostic. `rpc.handle(data)` takes a string or bytes and returns a string — everything else is up to you. This page shows how to wire it to transports beyond HTTP.
+`python-jsonrpc-lib` is transport-agnostic. `rpc.handle(data)` takes a string or bytes and returns a string **or `None`** — everything else is up to you. This page shows how to wire it to transports beyond HTTP.
+
+!!! warning "`handle()` returns `None` for notifications — check before you use it"
+    A notification is a request with no `id`, and the JSON-RPC spec says a server must not answer one. So `handle()` is typed `str | None`, and every transport has to decide what "nothing to send" means for it.
+
+    This is not an edge case you can defer. An unknown or empty method name still takes the notification branch, so a 29-byte body with no credentials and no knowledge of your method table is enough to reach it:
+
+    ```json
+    {"jsonrpc":"2.0","method":""}
+    ```
+
+    Dereferencing `None` there takes down a socket server as a whole process, and a restart-always supervisor does not help — the same packet kills it again. Every example on this page checks.
 
 ## TCP Server
 
@@ -46,8 +57,9 @@ def start_tcp_server(host='127.0.0.1', port=9000):
                 # Handle JSON-RPC
                 response = rpc.handle(data.decode('utf-8'))
 
-                # Send response
-                client.sendall(response.encode('utf-8'))
+                # Notifications produce no response - there is nothing to send
+                if response is not None:
+                    client.sendall(response.encode('utf-8'))
 
 if __name__ == '__main__':
     start_tcp_server()
@@ -88,9 +100,10 @@ async def handle_client(reader, writer):
         # Handle async
         response = await rpc.handle_async(message)
 
-        # Write response
-        writer.write(response.encode('utf-8'))
-        await writer.drain()
+        # Notifications produce no response - there is nothing to send
+        if response is not None:
+            writer.write(response.encode('utf-8'))
+            await writer.drain()
     finally:
         writer.close()
         await writer.wait_closed()
@@ -129,8 +142,9 @@ async def handle_websocket(websocket, path):
             # Handle JSON-RPC
             response = await rpc.handle_async(message)
 
-            # Send response
-            await websocket.send(response)
+            # Notifications produce no response - there is nothing to send
+            if response is not None:
+                await websocket.send(response)
     except websockets.exceptions.ConnectionClosed:
         print("WebSocket connection closed")
 
@@ -192,8 +206,9 @@ def process_queue():
         # Handle JSON-RPC
         response = rpc.handle(request.decode('utf-8'))
 
-        # Push response
-        r.lpush('rpc_responses', response)
+        # Notifications produce no response - there is nothing to push
+        if response is not None:
+            r.lpush('rpc_responses', response)
 
 if __name__ == '__main__':
     process_queue()
@@ -214,8 +229,9 @@ def on_message(client, userdata, msg):
     # Handle JSON-RPC request
     response = rpc.handle(msg.payload.decode('utf-8'))
 
-    # Publish response
-    client.publish('rpc/responses', response)
+    # Notifications produce no response - there is nothing to publish
+    if response is not None:
+        client.publish('rpc/responses', response)
 
 # Connect to MQTT broker
 client = mqtt.Client()
@@ -248,8 +264,9 @@ def main():
     # Handle request
     response = rpc.handle(request)
 
-    # Write response to stdout
-    print(response)
+    # Notifications produce no response - print nothing
+    if response is not None:
+        print(response)
 
 if __name__ == '__main__':
     main()
@@ -320,7 +337,8 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         with conn:
             data = conn.recv(4096)
             response = rpc.handle(data.decode('utf-8'))
-            conn.sendall(response.encode('utf-8'))
+            if response is not None:
+                conn.sendall(response.encode('utf-8'))
 ```
 
 **Client:**
@@ -342,9 +360,11 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
 
 ## Key Points
 
-- **Transport-agnostic**: `rpc.handle()` takes a string, returns a string — the transport is always your code
+- **Transport-agnostic**: `rpc.handle()` takes a string or bytes, returns `str | None` — the transport is always your code
+- **Always check for `None`**: a notification has no response; sending, publishing or encoding the result without checking is a crash reachable by an unauthenticated caller
 - **Sync or async**: `rpc.handle()` for blocking transports, `rpc.handle_async()` for asyncio-based ones
 - **Same methods everywhere**: register once, expose over any number of transports simultaneously
+- **Bytes must be UTF-8**: `handle()` decodes byte input strictly; other encodings are rejected as a parse error
 
 ## What's Next?
 

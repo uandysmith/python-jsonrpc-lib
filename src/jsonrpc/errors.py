@@ -13,6 +13,31 @@ Error codes:
 from dataclasses import dataclass
 from typing import Any
 
+# Longest run of caller-supplied text any error message will quote back.
+#
+# Some messages have to name what the caller sent - which parameter was unknown,
+# which method was not found - or the message helps nobody. That makes the
+# response size a function of the request: a 900 KB parameter name produced a
+# 1.8 MB response, doubled because 0.4.0 also puts the name in error.data. The
+# body limit bounds it, but a 2x amplifier on every rejected request is not
+# something to leave for the body limit alone to hold.
+#
+# 128 is far past any real method or field name and short enough that the quote
+# can no longer dominate the answer.
+MAX_ECHOED_LENGTH = 128
+
+
+def clip(text: str, limit: int = MAX_ECHOED_LENGTH) -> str:
+    """Shorten caller-supplied text before it goes into an error message.
+
+    The ellipsis is spelled out rather than a single character so the result
+    survives any encoding, and so a reader can tell truncation from a name that
+    genuinely ends in dots.
+    """
+    if len(text) <= limit:
+        return text
+    return f'{text[:limit]}... ({len(text)} characters)'
+
 
 @dataclass
 class RPCError:
@@ -45,10 +70,17 @@ class JSONRPCError(Exception):
         code: int | None = None,
         data: Any = None,
     ) -> None:
-        self._message = message if message is not None else self.message
-        self._code = code if code is not None else self.code
+        # Assign the public names, shadowing the class-level defaults. Keeping
+        # the real values in _code/_message only meant that the obvious thing to
+        # write in a handler - `log.error('%d %s', e.code, e.message)` - reported
+        # the class default rather than this error: ServerError('boom',
+        # code=-32050) read back as -32000 'Server error'.
+        self.message = message if message is not None else self.message
+        self.code = code if code is not None else self.code
+        self._message = self.message
+        self._code = self.code
         self.data = data
-        super().__init__(self._message)
+        super().__init__(self.message)
 
     @property
     def error(self) -> RPCError:
@@ -62,6 +94,22 @@ class JSONRPCError(Exception):
     def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-RPC error object dict."""
         return self.error.to_dict()
+
+
+class _DispatchWiringError(RuntimeError):
+    """The server is wired so that this call cannot be served.
+
+    Raised when dispatch is asked to do something the tree cannot do: run an
+    async method through the synchronous entry point, or run a chain whose
+    middleware only exists for the other direction. It stays a RuntimeError,
+    because that is the documented contract of dispatch() and it is a
+    programming error rather than a protocol one.
+
+    The distinction from an ordinary exception is that this message is written
+    for whoever wired the server and says only what they already know - the
+    method path and which entry point to use - so it is exempt from the
+    sanitization that keeps arbitrary exception text off the wire.
+    """
 
 
 class ParseError(JSONRPCError):
